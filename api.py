@@ -178,20 +178,95 @@ async def text_alignment(
         waveform, sample_rate = torchaudio.load(audio_io)
         waveform = waveform.mean(0)
 
-        # TODO: 实现文本对齐逻辑
-        # 目前模型代码中没有直接的文本对齐功能
-        # 需要进一步了解具体的对齐实现方式
+        # 先进行语音识别
+        start_time = time.time()
+        result = m.inference(
+            data_in=waveform,
+            language=language,
+            use_itn=True,
+            output_timestamp=True,
+            ban_emo_unk=False,
+            fs=sample_rate,
+            **kwargs
+        )
+
+        if len(result) == 0 or len(result[0]) == 0:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "No speech detected"}
+            )
+
+        # 获取识别结果
+        timestamps = result[0][0]["timestamp"]
+        recognized_text = rich_transcription_postprocess(result[0][0]["text"])
+
+        # 处理输入文本，按标点符号分段
+        input_segments = re.split(r'[。，、！？.,!?]', text)
+        input_segments = [s.strip() for s in input_segments if s.strip()]
+
+        # 构建对齐结果
+        alignment_result = []
+        current_text = []
+        current_timestamps = []
+
+        for i, ts in enumerate(timestamps):
+            if len(ts) >= 3:
+                char, start_time, end_time = ts
+                if char not in ['。', '，', '、', '！', '？', '.', ',', '!', '?']:
+                    current_text.append(char)
+                    current_timestamps.append([start_time, end_time])
+                
+                if char in ['。', '，', '、', '！', '？', '.', ',', '!', '?'] or i == len(timestamps) - 1:
+                    recognized_segment = ''.join(current_text).strip()
+                    if recognized_segment:
+                        # 找到最匹配的输入文本段
+                        best_match = find_best_match(recognized_segment, input_segments)
+                        if best_match:
+                            alignment_result.append({
+                                "recognizedText": recognized_segment,
+                                "alignedText": best_match,
+                                "timestamps": [
+                                    current_timestamps[0][0],
+                                    current_timestamps[-1][1]
+                                ]
+                            })
+                            # 从待匹配列表中移除已匹配的文本
+                            input_segments.remove(best_match)
+                    
+                    current_text = []
+                    current_timestamps = []
+
+        process_time = time.time() - start_time
 
         return {
             "success": True,
-            "message": "Text alignment feature is under development"
+            "process_time": f"{process_time:.2f}s",
+            "recognized_text": recognized_text,
+            "alignment_result": alignment_result
         }
 
     except Exception as e:
+        print(f"Error: {str(e)}")
         return JSONResponse(
             status_code=500,
             content={"error": str(e)}
         )
+
+def find_best_match(recognized_text, input_segments):
+    """使用简单的相似度匹配找到最匹配的文本段"""
+    if not input_segments:
+        return None
+    
+    def similarity(a, b):
+        # 可以使用更复杂的相似度算法
+        return len(set(a) & set(b)) / len(set(a) | set(b))
+    
+    similarities = [similarity(recognized_text, segment) for segment in input_segments]
+    max_similarity = max(similarities)
+    
+    if max_similarity > 0.5:  # 相似度阈值
+        return input_segments[similarities.index(max_similarity)]
+    return None
 
 @app.get("/api/v1/languages")
 async def get_supported_languages():
