@@ -231,7 +231,11 @@ async def text_alignment(
     - auto_split: 是否自动分段
     """
     try:
-        start_time = time.perf_counter()  # 使用性能计数器获取更精确的时间
+        # 使用 perf_counter 获取更精确的时间
+        start_time = time.time()
+      
+        
+        
         
         # 读取音频文件
         content = await file.read()
@@ -249,6 +253,8 @@ async def text_alignment(
             fs=sample_rate,
             **kwargs
         )
+
+        process_time = time.time() - start_time
 
         if len(result) == 0 or len(result[0]) == 0:
             return JSONResponse(
@@ -332,11 +338,9 @@ async def text_alignment(
                 
                 current_time += duration
 
-        process_time = round(time.perf_counter() - start_time, 2)
-
         return {
             "success": True,
-            "process_time": f"{process_time}s",
+            "process_time": f"{process_time:.2f}s",  # 只返回数值，不加单位
             "recognized_text": recognized_text,
             "alignment_result": alignment_result
         }
