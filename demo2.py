@@ -33,5 +33,5 @@ res = m.inference(
 
 timestamp = res[0][0]["timestamp"]
 text = rich_transcription_postprocess(res[0][0]["text"])
-print(text)
-print(timestamp)
+print('text:',text)
+print('timestamp:',timestamp)
