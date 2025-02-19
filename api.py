@@ -14,6 +14,11 @@ from funasr.utils.postprocess_utils import rich_transcription_postprocess
 from io import BytesIO
 import time
 from fastapi.middleware.cors import CORSMiddleware
+import subprocess
+import numpy as np
+from pathlib import Path
+import tempfile
+import uuid
 
 
 class Language(str, Enum):
@@ -87,7 +92,7 @@ async def speech_to_text(
             language=language,
             use_itn=use_itn,
             output_timestamp=True,  # 强制开启时间戳输出
-            ban_emo_unk=False,      # 不禁用情感未知标签
+            ban_emo_unk=True,      # 不禁用情感未知标签
             fs=sample_rate,
             **kwargs
         )
@@ -223,19 +228,8 @@ async def text_alignment(
     language: Annotated[Language, Form()] = "auto",
     auto_split: Annotated[bool, Form()] = True
 ):
-    """
-    文本对齐打轴接口
-    - file: 音频文件
-    - text: 待对齐的文本内容
-    - language: 语言选择
-    - auto_split: 是否自动分段
-    """
     try:
-        # 使用 perf_counter 获取更精确的时间
         start_time = time.time()
-      
-        
-        
         
         # 读取音频文件
         content = await file.read()
@@ -254,8 +248,6 @@ async def text_alignment(
             **kwargs
         )
 
-        process_time = time.time() - start_time
-
         if len(result) == 0 or len(result[0]) == 0:
             return JSONResponse(
                 status_code=400,
@@ -266,18 +258,30 @@ async def text_alignment(
         timestamps = result[0][0]["timestamp"]
         recognized_text = rich_transcription_postprocess(result[0][0]["text"])
 
-        # 获取音频总时长
-        total_duration = timestamps[-1][2]  # 使用最后一个时间戳的结束时间
-        
-        # 处理输入文本，按标点符号分段
-        input_segments = re.split(r'[。，、！？.,!?]', text)
-        input_segments = [s.strip() for s in input_segments if s.strip()]
-        remaining_segments = input_segments.copy()  # 创建副本以保留原始输入
-        
-        # 先进行正常的对齐
-        alignment_result = []
+        # 处理输入文本
+        input_sentences = []
+        current_sentence = []
+
+        # 分割输入文本为句子，并去除标点符号
+        for char in text:
+            if char in ['。', '，', '、', '！', '？', '.', ',', '!', '?']:
+                sentence = ''.join(current_sentence).strip()
+                if sentence:
+                    input_sentences.append(sentence)  # 不添加标点
+                current_sentence = []
+            else:
+                current_sentence.append(char)
+
+        # 处理最后一个句子
+        if current_sentence:
+            sentence = ''.join(current_sentence).strip()
+            if sentence:
+                input_sentences.append(sentence)
+
+        # 文本对齐处理
         current_text = []
         current_timestamps = []
+        alignment_results = []
 
         for i, ts in enumerate(timestamps):
             if len(ts) >= 3:
@@ -290,59 +294,45 @@ async def text_alignment(
                     recognized_segment = ''.join(current_text).strip()
                     if recognized_segment:
                         # 找到最匹配的输入文本段
-                        best_match = find_best_match(recognized_segment, remaining_segments)
+                        best_match = find_best_match(recognized_segment, input_sentences)
                         if best_match:
-                            alignment_result.append({
+                            alignment_item = {
                                 "recognizedText": recognized_segment,
-                                "alignedText": best_match,
+                                "alignedText": best_match,  # 已经没有标点符号
                                 "timestamps": [
                                     current_timestamps[0][0],
                                     current_timestamps[-1][1]
                                 ]
-                            })
-                            remaining_segments.remove(best_match)  # 从剩余段落中移除
+                            }
+                            alignment_results.append(alignment_item)
+                            input_sentences.remove(best_match)
                     
                     current_text = []
                     current_timestamps = []
 
-        # 如果还有未匹配的输入段落，进行智能调整
-        if remaining_segments:
-            # 获取已匹配段落的最后时间戳
-            last_end_time = alignment_result[-1]["timestamps"][1] if alignment_result else 0
-            remaining_duration = total_duration - last_end_time
-            
-            # 计算剩余段落的权重
-            remaining_lengths = [len(seg) for seg in remaining_segments]
-            remaining_total_length = sum(remaining_lengths)
-            remaining_weights = [length / remaining_total_length for length in remaining_lengths]
-            
-            # 为剩余段落分配时间
-            current_time = last_end_time
-            
-            for i, segment in enumerate(remaining_segments):
-                # 计算当前段落应该分配的时长
-                if i == len(remaining_segments) - 1:
-                    duration = total_duration - current_time
-                else:
-                    duration = remaining_duration * remaining_weights[i]
+        # 处理剩余未匹配的输入文本
+        if input_sentences:
+            last_timestamp = alignment_results[-1]["timestamps"][1] if alignment_results else 0
+            step = 0.02
+
+            for i, sentence in enumerate(input_sentences):
+                start_time = last_timestamp + i * step
+                end_time = start_time + step
                 
-                # 添加新的对齐结果
-                alignment_result.append({
-                    "recognizedText": "",  # 识别文本为空
-                    "alignedText": segment,
-                    "timestamps": [
-                        current_time,
-                        current_time + duration
-                    ]
-                })
-                
-                current_time += duration
+                alignment_item = {
+                    "recognizedText": "",
+                    "alignedText": sentence,  # 已经没有标点符号
+                    "timestamps": [start_time, end_time]
+                }
+                alignment_results.append(alignment_item)
+
+        process_time = time.time() - start_time
 
         return {
             "success": True,
-            "process_time": f"{process_time:.2f}s",  # 只返回数值，不加单位
+            "process_time": f"{process_time:.2f}s",
             "recognized_text": recognized_text,
-            "alignment_result": alignment_result
+            "alignment_result": alignment_results
         }
 
     except Exception as e:
@@ -442,6 +432,343 @@ async def get_supported_languages():
             {"code": "ko", "name": "韩语"}
         ]
     }
+
+def convert_to_wav(input_file_path: str, output_file_path: str) -> bool:
+    """
+    使用 ffmpeg 将音频转换为 wav 格式
+    """
+    try:
+        cmd = [
+            'ffmpeg', '-i', input_file_path,
+            '-acodec', 'pcm_s16le',
+            '-ac', '1',  # 转换为单声道
+            '-ar', '16000',  # 采样率16kHz
+            '-y',  # 覆盖已存在的文件
+            output_file_path
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"FFmpeg conversion error: {e.stderr.decode()}")
+        return False
+
+def split_audio(waveform: torch.Tensor, sample_rate: int, max_duration: int = 30) -> List[torch.Tensor]:
+    """
+    将音频切割成指定最大时长的片段
+    """
+    total_samples = waveform.size(-1)
+    max_samples = max_duration * sample_rate
+    
+    # 如果音频长度小于最大时长，直接返回
+    if total_samples <= max_samples:
+        return [waveform]
+    
+    # 计算需要切割的片段数
+    num_segments = (total_samples + max_samples - 1) // max_samples
+    segments = []
+    
+    for i in range(num_segments):
+        start_sample = i * max_samples
+        end_sample = min((i + 1) * max_samples, total_samples)
+        segment = waveform[..., start_sample:end_sample]
+        segments.append(segment)
+    
+    return segments
+
+def merge_results(results: List[dict]) -> dict:
+    """
+    合并多个识别结果
+    """
+    merged_full_text = ""
+    merged_subtitles = []
+    current_time_offset = 0.0
+    
+    for result in results:
+        # 合并全文
+        if merged_full_text:
+            merged_full_text += " "
+        merged_full_text += result["full_text"]
+        
+        # 调整时间戳并合并字幕
+        for subtitle in result["subtitles"]:
+            adjusted_subtitle = {
+                "text": subtitle["text"],
+                "timestamps": [
+                    subtitle["timestamps"][0] + current_time_offset,
+                    subtitle["timestamps"][1] + current_time_offset
+                ]
+            }
+            merged_subtitles.append(adjusted_subtitle)
+        
+        # 更新时间偏移
+        if result["subtitles"]:
+            current_time_offset = merged_subtitles[-1]["timestamps"][1]
+    
+    return {
+        "full_text": merged_full_text,
+        "subtitles": merged_subtitles
+    }
+
+@app.post("/api/v1/vip/asr")
+async def vip_speech_to_text(
+    file: UploadFile,
+    language: Annotated[Language, Form()] = "auto",
+    use_itn: Annotated[bool, Form()] = True,
+    output_timestamp: Annotated[bool, Form()] = True
+):
+    """
+    VIP语音识别接口，支持更长的音频和多种格式
+    - file: 音频文件(支持多种格式)
+    - language: 语言选择
+    - use_itn: 是否使用文本正则化
+    - output_timestamp: 是否输出时间戳
+    """
+    try:
+        start_time = time.time()
+        
+        # 创建临时目录
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # 保存上传的文件
+            temp_input = Path(temp_dir) / f"{uuid.uuid4()}{Path(file.filename).suffix}"
+            temp_wav = Path(temp_dir) / f"{uuid.uuid4()}.wav"
+            
+            with open(temp_input, "wb") as f:
+                content = await file.read()
+                f.write(content)
+            
+            # 转换为 WAV 格式
+            if not convert_to_wav(str(temp_input), str(temp_wav)):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "Failed to convert audio format"}
+                )
+            
+            # 读取转换后的音频
+            waveform, sample_rate = torchaudio.load(temp_wav)
+            waveform = waveform.mean(0)  # 转为单声道
+            
+            # 切割音频
+            segments = split_audio(waveform, sample_rate)
+            
+            # 处理每个片段
+            results = []
+            for segment in segments:
+                # 识别
+                result = m.inference(
+                    data_in=segment,
+                    language=language,
+                    use_itn=use_itn,
+                    output_timestamp=True,
+                    ban_emo_unk=True,
+                    fs=sample_rate,
+                    **kwargs
+                )
+                
+                if len(result) == 0 or len(result[0]) == 0:
+                    continue
+                
+                # 处理结果
+                timestamps = result[0][0]["timestamp"]
+                full_text = rich_transcription_postprocess(result[0][0]["text"])
+                
+                # 处理时间戳和对应的文本片段
+                subtitles = []
+                current_text = []
+                current_timestamps = []
+                
+                for i, ts in enumerate(timestamps):
+                    if len(ts) >= 3:
+                        char, start_time, end_time = ts
+                        if char not in ['。', '，', '、', '！', '？', '.', ',', '!', '?']:
+                            current_text.append(char)
+                            current_timestamps.append([start_time, end_time])
+                        
+                        if char in ['。', '，', '、', '！', '？', '.', ',', '!', '?'] or i == len(timestamps) - 1:
+                            sentence = ''.join(current_text).strip()
+                            if sentence and current_timestamps:
+                                subtitle = {
+                                    "text": sentence,
+                                    "timestamps": [
+                                        current_timestamps[0][0],
+                                        current_timestamps[-1][1]
+                                    ]
+                                }
+                                subtitles.append(subtitle)
+                                current_text = []
+                                current_timestamps = []
+                
+                results.append({
+                    "full_text": full_text,
+                    "subtitles": subtitles
+                })
+            
+            # 合并所有结果
+            if not results:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "No speech detected"}
+                )
+                
+            merged_result = merge_results(results)
+            process_time = time.time() - start_time
+            
+            return {
+                "success": True,
+                "process_time": f"{process_time:.2f}s",
+                "full_text": merged_result["full_text"],
+                "subtitles": merged_result["subtitles"]
+            }
+
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+@app.post("/api/v1/vip/align")
+async def vip_text_alignment(
+    file: UploadFile,
+    text: Annotated[str, Form()],
+    language: Annotated[Language, Form()] = "auto",
+    auto_split: Annotated[bool, Form()] = True
+):
+    try:
+        start_time = time.time()
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # 保存上传的文件并转换格式
+            temp_input = Path(temp_dir) / f"{uuid.uuid4()}{Path(file.filename).suffix}"
+            temp_wav = Path(temp_dir) / f"{uuid.uuid4()}.wav"
+            
+            with open(temp_input, "wb") as f:
+                content = await file.read()
+                f.write(content)
+            
+            # 转换为 WAV 格式（VIP特性：支持多种格式）
+            if not convert_to_wav(str(temp_input), str(temp_wav)):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "Failed to convert audio format"}
+                )
+            
+            # 读取转换后的音频
+            waveform, sample_rate = torchaudio.load(temp_wav)
+            waveform = waveform.mean(0)  # 转为单声道
+            
+            # 切割音频（VIP特性：支持长音频）
+            segments = split_audio(waveform, sample_rate)
+            all_results = []
+            recognized_text_full = ""
+            
+            # 处理输入文本
+            input_sentences = []
+            current_sentence = []
+            
+            # 分割输入文本为句子，并去除标点符号
+            for char in text:
+                if char in ['。', '，', '、', '！', '？', '.', ',', '!', '?']:
+                    sentence = ''.join(current_sentence).strip()
+                    if sentence:
+                        input_sentences.append(sentence)  # 不添加标点
+                    current_sentence = []
+                else:
+                    current_sentence.append(char)
+            
+            # 处理最后一个句子
+            if current_sentence:
+                sentence = ''.join(current_sentence).strip()
+                if sentence:
+                    input_sentences.append(sentence)
+            
+            # 处理每个音频片段
+            for segment in segments:
+                result = m.inference(
+                    data_in=segment,
+                    language=language,
+                    use_itn=True,
+                    output_timestamp=True,
+                    ban_emo_unk=True,
+                    fs=sample_rate,
+                    **kwargs
+                )
+                
+                if len(result) == 0 or len(result[0]) == 0:
+                    continue
+                
+                # 处理识别结果
+                recognized_text = rich_transcription_postprocess(result[0][0]["text"])
+                timestamps = result[0][0]["timestamp"]
+                recognized_text_full += recognized_text
+                
+                # 文本对齐处理
+                current_text = []
+                current_timestamps = []
+                
+                for i, ts in enumerate(timestamps):
+                    if len(ts) >= 3:
+                        char, start_time, end_time = ts
+                        if char not in ['。', '，', '、', '！', '？', '.', ',', '!', '?']:
+                            current_text.append(char)
+                            current_timestamps.append([start_time, end_time])
+                        
+                        if char in ['。', '，', '、', '！', '？', '.', ',', '!', '?'] or i == len(timestamps) - 1:
+                            recognized_segment = ''.join(current_text).strip()
+                            if recognized_segment:
+                                # 找到最匹配的输入文本段
+                                best_match = find_best_match(recognized_segment, input_sentences)
+                                if best_match:
+                                    alignment_item = {
+                                        "recognizedText": recognized_segment,
+                                        "alignedText": best_match,  # 已经没有标点符号
+                                        "timestamps": [
+                                            current_timestamps[0][0],
+                                            current_timestamps[-1][1]
+                                        ]
+                                    }
+                                    all_results.append(alignment_item)
+                                    input_sentences.remove(best_match)
+                            
+                            current_text = []
+                            current_timestamps = []
+            
+            if not all_results:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "No speech detected"}
+                )
+            
+            # 处理剩余未匹配的输入文本
+            if input_sentences:
+                last_timestamp = all_results[-1]["timestamps"][1]
+                step = 0.02
+                
+                for i, sentence in enumerate(input_sentences):
+                    start_time = last_timestamp + i * step
+                    end_time = start_time + step
+                    
+                    alignment_item = {
+                        "recognizedText": "",
+                        "alignedText": sentence,  # 已经没有标点符号
+                        "timestamps": [start_time, end_time]
+                    }
+                    all_results.append(alignment_item)
+            
+            process_time = time.time() - start_time
+            
+            return {
+                "success": True,
+                "process_time": f"{process_time:.2f}s",
+                "recognized_text": recognized_text_full,
+                "alignment_result": all_results
+            }
+
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
 
 if __name__ == "__main__":
     import uvicorn
