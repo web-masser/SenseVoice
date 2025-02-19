@@ -162,71 +162,94 @@ def format_time(seconds):
     secs = int(secs)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millisecs:03d}"
 
-def adjust_timestamps(recognized_segments, input_segments, total_duration):
-    """智能调整时间戳以匹配输入文本段落数量"""
-    if not input_segments:
+def adjust_timestamps(segments, total_time, smart_distribution=True):
+    """
+    调整所有段落的时间戳
+    - segments: 所有段落（包括已识别和未识别的）
+    - total_time: 总时间
+    - smart_distribution: 是否使用智能分配
+    """
+    if not segments:
         return []
     
-    # 计算输入文本段落的长度权重
-    input_lengths = [len(seg) for seg in input_segments]
-    total_input_length = sum(input_lengths)
-    input_weights = [length / total_input_length for length in input_lengths]
+    results = []
+    current_time = 0
     
-    result = []
-    
-    # 1. 先保留所有已识别的段落
-    for i in range(len(recognized_segments)):
-        result.append({
-            "recognizedText": recognized_segments[i]["recognizedText"],
-            "alignedText": recognized_segments[i]["alignedText"],
-            "timestamps": recognized_segments[i]["timestamps"]
-        })
-    
-    # 2. 计算剩余时间和剩余段落
-    last_end_time = recognized_segments[-1]["timestamps"][1] if recognized_segments else 0
-    remaining_duration = total_duration - last_end_time
-    remaining_segments = input_segments[len(recognized_segments):]
-    
-    if not remaining_segments:
-        return result
-    
-    # 3. 计算剩余段落的权重
-    remaining_lengths = [len(seg) for seg in remaining_segments]
-    remaining_total_length = sum(remaining_lengths)
-    remaining_weights = [length / remaining_total_length for length in remaining_lengths]
-    
-    # 4. 为剩余段落分配时间
-    current_time = last_end_time
-    
-    for i, segment in enumerate(remaining_segments):
-        # 计算当前段落应该分配的时长
-        if i == len(remaining_segments) - 1:
-            # 最后一个段落使用所有剩余时间
-            duration = total_duration - current_time
-        else:
-            # 根据文本长度权重分配时间
-            duration = remaining_duration * remaining_weights[i]
+    if smart_distribution:
+        # 智能分配：根据文本长度
+        total_chars = sum(len(segment["alignedText"]) for segment in segments)
         
-        # 添加新的对齐结果
-        result.append({
-            "recognizedText": "",  # 识别文本为空
-            "alignedText": segment,
-            "timestamps": [
-                current_time,
-                current_time + duration
-            ]
-        })
+        for segment in segments:
+            duration = (len(segment["alignedText"]) / total_chars) * total_time if total_chars > 0 else 0.1
+            
+            segment["timestamps"] = [current_time, current_time + duration]
+            results.append(segment)
+            current_time += duration
+    else:
+        # 平均分配：每段时间相等
+        segment_duration = total_time / len(segments)
         
-        current_time += duration
+        for segment in segments:
+            segment["timestamps"] = [current_time, current_time + segment_duration]
+            results.append(segment)
+            current_time += segment_duration
     
-    return result
+    return results
+
+def distribute_remaining_time(unmatched_sentences, last_timestamp, total_time=1.0, smart_distribution=True):
+    """
+    分配时间段
+    - unmatched_sentences: 未匹配的文本列表
+    - last_timestamp: 最后一个已匹配文本的结束时间
+    - total_time: 为未匹配文本预留的总时间（默认1秒）
+    - smart_distribution: 是否使用智能分配（根据文本长度）
+    """
+    results = []
+    
+    if smart_distribution:
+        # 智能分配：根据文本长度
+        total_chars = sum(len(sentence) for sentence in unmatched_sentences)
+        current_time = last_timestamp
+        
+        for sentence in unmatched_sentences:
+            duration = (len(sentence) / total_chars) * total_time if total_chars > 0 else 0.1
+            
+            alignment_item = {
+                "recognizedText": "",
+                "alignedText": sentence,
+                "timestamps": [
+                    current_time,
+                    current_time + duration
+                ]
+            }
+            results.append(alignment_item)
+            current_time += duration
+    else:
+        # 平均分配：每段时间相等
+        segment_duration = total_time / len(unmatched_sentences) if unmatched_sentences else 0.1
+        current_time = last_timestamp
+        
+        for sentence in unmatched_sentences:
+            alignment_item = {
+                "recognizedText": "",
+                "alignedText": sentence,
+                "timestamps": [
+                    current_time,
+                    current_time + segment_duration
+                ]
+            }
+            results.append(alignment_item)
+            current_time += segment_duration
+    
+    return results
 
 @app.post("/api/v1/align")
 async def text_alignment(
     file: UploadFile,
     text: Annotated[str, Form()],
     language: Annotated[Language, Form()] = "auto",
-    auto_split: Annotated[bool, Form()] = True
+    auto_split: Annotated[bool, Form()] = True,
+    smart_time_distribution: Annotated[bool, Form()] = True
 ):
     try:
         start_time = time.time()
@@ -312,19 +335,24 @@ async def text_alignment(
 
         # 处理剩余未匹配的输入文本
         if input_sentences:
-            last_timestamp = alignment_results[-1]["timestamps"][1] if alignment_results else 0
-            step = 0.02
-
-            for i, sentence in enumerate(input_sentences):
-                start_time = last_timestamp + i * step
-                end_time = start_time + step
-                
+            # 为未匹配文本创建结果项
+            for sentence in input_sentences:
                 alignment_item = {
                     "recognizedText": "",
-                    "alignedText": sentence,  # 已经没有标点符号
-                    "timestamps": [start_time, end_time]
+                    "alignedText": sentence,
+                    "timestamps": [0, 0]  # 临时时间戳
                 }
                 alignment_results.append(alignment_item)
+
+        # 获取音频总时长
+        total_duration = timestamps[-1][2] if timestamps else 30.0  # 默认30秒
+        
+        # 重新调整所有段落的时间戳
+        alignment_results = adjust_timestamps(
+            alignment_results,
+            total_duration,
+            smart_time_distribution
+        )
 
         process_time = time.time() - start_time
 
@@ -631,7 +659,8 @@ async def vip_text_alignment(
     file: UploadFile,
     text: Annotated[str, Form()],
     language: Annotated[Language, Form()] = "auto",
-    auto_split: Annotated[bool, Form()] = True
+    auto_split: Annotated[bool, Form()] = True,
+    smart_time_distribution: Annotated[bool, Form()] = True
 ):
     try:
         start_time = time.time()
@@ -740,20 +769,25 @@ async def vip_text_alignment(
             
             # 处理剩余未匹配的输入文本
             if input_sentences:
-                last_timestamp = all_results[-1]["timestamps"][1]
-                step = 0.02
-                
-                for i, sentence in enumerate(input_sentences):
-                    start_time = last_timestamp + i * step
-                    end_time = start_time + step
-                    
+                # 为未匹配文本创建结果项
+                for sentence in input_sentences:
                     alignment_item = {
                         "recognizedText": "",
-                        "alignedText": sentence,  # 已经没有标点符号
-                        "timestamps": [start_time, end_time]
+                        "alignedText": sentence,
+                        "timestamps": [0, 0]  # 临时时间戳
                     }
                     all_results.append(alignment_item)
+
+            # 获取音频总时长
+            total_duration = timestamps[-1][2] if timestamps else 30.0  # 默认30秒
             
+            # 重新调整所有段落的时间戳
+            all_results = adjust_timestamps(
+                all_results,
+                total_duration,
+                smart_time_distribution
+            )
+
             process_time = time.time() - start_time
             
             return {

@@ -16,70 +16,23 @@ model = AutoModel(
     vad_model="fsmn-vad",
     vad_kwargs={"max_single_segment_time": 30000},
     device="cuda:0",
+    ban_emo_unk=True,
 )
+
+# data_in=f"E:/project/SenseVoice/temp_segments/69bca089-55ef-48f0-b6ec-7f59a046ae46/segment_0.mp3",
 
 # en
 res = model.generate(
-    input=f"{model.model_path}/example/en.mp3",
+    input=f"E:/M800002mRbOA2rFHEV.mp3",
     cache={},
     language="auto",  # "zh", "en", "yue", "ja", "ko", "nospeech"
     use_itn=True,
     batch_size_s=60,
     merge_vad=True,  #
     merge_length_s=15,
+    ban_emo_unk=True,
 )
 text = rich_transcription_postprocess(res[0]["text"])
-print(text)
+print(text, 'text')
+print(res, 'res')
 
-# zh
-res = model.generate(
-    input=f"{model.model_path}/example/zh.mp3",
-    cache={},
-    language="auto",  # "zh", "en", "yue", "ja", "ko", "nospeech"
-    use_itn=True,
-    batch_size_s=60,
-    merge_vad=True,  #
-    merge_length_s=15,
-)
-text = rich_transcription_postprocess(res[0]["text"])
-print(text)
-
-# yue
-res = model.generate(
-    input=f"{model.model_path}/example/yue.mp3",
-    cache={},
-    language="auto",  # "zh", "en", "yue", "ja", "ko", "nospeech"
-    use_itn=True,
-    batch_size_s=60,
-    merge_vad=True,  #
-    merge_length_s=15,
-)
-text = rich_transcription_postprocess(res[0]["text"])
-print(text)
-
-# ja
-res = model.generate(
-    input=f"{model.model_path}/example/ja.mp3",
-    cache={},
-    language="auto",  # "zh", "en", "yue", "ja", "ko", "nospeech"
-    use_itn=True,
-    batch_size_s=60,
-    merge_vad=True,  #
-    merge_length_s=15,
-)
-text = rich_transcription_postprocess(res[0]["text"])
-print(text)
-
-
-# ko
-res = model.generate(
-    input=f"{model.model_path}/example/ko.mp3",
-    cache={},
-    language="auto",  # "zh", "en", "yue", "ja", "ko", "nospeech"
-    use_itn=True,
-    batch_size_s=60,
-    merge_vad=True,  #
-    merge_length_s=15,
-)
-text = rich_transcription_postprocess(res[0]["text"])
-print(text)

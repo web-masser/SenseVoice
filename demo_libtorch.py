@@ -12,7 +12,9 @@ model_dir = "iic/SenseVoiceSmall"
 
 model = SenseVoiceSmall(model_dir, batch_size=10, device="cuda:0")
 
-wav_or_scp = ["{}/.cache/modelscope/hub/{}/example/en.mp3".format(Path.home(), model_dir)]
+wav_or_scp = ["E:/project/SenseVoice/temp_segments/69bca089-55ef-48f0-b6ec-7f59a046ae46/segment_0.mp3"]
 
 res = model(wav_or_scp, language="auto", use_itn=True)
 print([rich_transcription_postprocess(i) for i in res])
+
+print(res)
