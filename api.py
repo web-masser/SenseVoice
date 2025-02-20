@@ -311,34 +311,45 @@ async def text_alignment(
             # 分割输入文本（按逗号分割）
             input_sentences = [s.strip() for s in text.split(',') if s.strip()]
             
-            # 创建对齐结果
-            alignment_results = []
-            
+            # 在计算总时长之前，先计算 max_length
             # 使用较长的列表的长度作为循环次数
             max_length = max(len(recognized_sentences), len(input_sentences))
-            
+
+            # 获取总时长
+            total_time = 0
+            if recognized_sentences:
+                last_segment = recognized_sentences[-1]
+                # timestamps 是 [start_time, end_time] 格式
+                total_time = last_segment["timestamps"][1]  # 使用结束时间
+
+            # 计算每个段落应该分配的时间
+            segment_duration = total_time / max_length if max_length > 0 else 30
+
+            # 创建对齐结果
+            alignment_results = []
+
             # 创建所有对齐项
             for i in range(max_length):
-                # 如果有识别文本，使用它；否则使用空字符串
-                recognized = recognized_sentences[i] if i < len(recognized_sentences) else {"text": "", "timestamps": [0, 0]}
+                # 如果有识别文本，使用它的时间戳；否则计算一个合理的时间戳
+                if i < len(recognized_sentences):
+                    recognized = recognized_sentences[i]
+                    timestamps = recognized["timestamps"]
+                else:
+                    # 为多余的段落计算时间戳
+                    start_time = i * segment_duration
+                    end_time = (i + 1) * segment_duration
+                    timestamps = [start_time, end_time]
+                    recognized = {"text": "", "timestamps": timestamps}
+                
                 # 如果有输入文本，使用它；否则使用空字符串
                 input_text = input_sentences[i] if i < len(input_sentences) else ""
                 
                 alignment_item = {
                     "recognizedText": recognized["text"],
                     "alignedText": input_text,
-                    "timestamps": recognized["timestamps"]
+                    "timestamps": timestamps
                 }
                 alignment_results.append(alignment_item)
-            
-            # 调整时间戳
-            if smart_time_distribution and alignment_results:
-                total_time = timestamps[-1][2] if timestamps else 30.0
-                alignment_results = adjust_timestamps(
-                    segments=alignment_results,
-                    total_time=total_time,
-                    smart_distribution=True
-                )
             
             process_time = time.time() - start_time
             
@@ -699,23 +710,43 @@ async def vip_text_alignment_ws(websocket: WebSocket):
             # 分割输入文本（按逗号分割）
             input_sentences = [s.strip() for s in text.split(',') if s.strip()]
             
-            # 创建对齐结果
-            alignment_results = []
-            
+            # 在计算总时长之前，先计算 max_length
             # 使用较长的列表的长度作为循环次数
             max_length = max(len(recognized_sentences), len(input_sentences))
-            
+
+            # 获取总时长
+            total_time = 0
+            if recognized_sentences:
+                last_segment = recognized_sentences[-1]
+                # timestamps 是 [start_time, end_time] 格式
+                total_time = last_segment["timestamps"][1]  # 使用结束时间
+
+            # 计算每个段落应该分配的时间
+            segment_duration = total_time / max_length if max_length > 0 else 30
+
+            # 创建对齐结果
+            alignment_results = []
+
             # 创建所有对齐项
             for i in range(max_length):
-                # 如果有识别文本，使用它；否则使用空字符串
-                recognized = recognized_sentences[i] if i < len(recognized_sentences) else {"text": "", "timestamps": [0, 0]}
+                # 如果有识别文本，使用它的时间戳；否则计算一个合理的时间戳
+                if i < len(recognized_sentences):
+                    recognized = recognized_sentences[i]
+                    timestamps = recognized["timestamps"]
+                else:
+                    # 为多余的段落计算时间戳
+                    start_time = i * segment_duration
+                    end_time = (i + 1) * segment_duration
+                    timestamps = [start_time, end_time]
+                    recognized = {"text": "", "timestamps": timestamps}
+                
                 # 如果有输入文本，使用它；否则使用空字符串
                 input_text = input_sentences[i] if i < len(input_sentences) else ""
                 
                 alignment_item = {
                     "recognizedText": recognized["text"],
                     "alignedText": input_text,
-                    "timestamps": recognized["timestamps"]
+                    "timestamps": timestamps
                 }
                 alignment_results.append(alignment_item)
             
