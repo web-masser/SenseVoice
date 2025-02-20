@@ -2,10 +2,10 @@
 # export SENSEVOICE_DEVICE=cuda:1
 
 import os, re
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 from typing_extensions import Annotated
-from typing import List, Optional
+from typing import List, Optional, Dict
 from enum import Enum
 import torchaudio
 import torch
@@ -20,6 +20,8 @@ from pathlib import Path
 import tempfile
 import uuid
 import ssl
+import json
+import asyncio
 
 
 class Language(str, Enum):
@@ -48,6 +50,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 存储WebSocket连接
+websocket_connections: Dict[str, WebSocket] = {}
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -804,6 +808,122 @@ async def vip_text_alignment(
             status_code=500,
             content={"error": str(e)}
         )
+
+@app.websocket("/api/v1/vip/asr/ws")
+async def vip_speech_to_text_ws(websocket: WebSocket):
+    await websocket.accept()
+    
+    try:
+        # 接收音频数据
+        data = await websocket.receive_bytes()
+        
+        # 创建临时目录处理音频
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # 保存接收到的音频数据
+            temp_input = Path(temp_dir) / f"{uuid.uuid4()}.wav"
+            with open(temp_input, "wb") as f:
+                f.write(data)
+            
+            # 读取音频
+            waveform, sample_rate = torchaudio.load(temp_input)
+            waveform = waveform.mean(0)  # 转为单声道
+            
+            # 切割音频
+            segments = split_audio(waveform, sample_rate)
+            total_segments = len(segments)
+            
+            # 处理每个片段
+            all_results = []
+            
+            # 发送总片段数
+            await websocket.send_json({
+                "type": "start",
+                "total_segments": total_segments
+            })
+            
+            # 串行处理每个片段
+            for i, segment in enumerate(segments, 1):
+                # 发送当前正在处理的片段信息
+                await websocket.send_json({
+                    "type": "processing",
+                    "current_segment": i,
+                    "total_segments": total_segments,
+                    "message": f"正在处理第 {i}/{total_segments} 段..."
+                })
+                
+                # 识别当前片段
+                result = m.inference(
+                    data_in=segment,
+                    language="auto",
+                    use_itn=True,
+                    output_timestamp=True,
+                    ban_emo_unk=True,
+                    fs=sample_rate,
+                    **kwargs
+                )
+                
+                if len(result) > 0 and len(result[0]) > 0:
+                    # 处理识别结果
+                    timestamps = result[0][0]["timestamp"]
+                    text = rich_transcription_postprocess(result[0][0]["text"])
+                    
+                    # 处理字幕
+                    subtitles = []
+                    current_text = []
+                    current_timestamps = []
+                    
+                    for j, ts in enumerate(timestamps):
+                        if len(ts) >= 3:
+                            char, start_time, end_time = ts
+                            if char not in ['。', '，', '、', '！', '？', '.', ',', '!', '?']:
+                                current_text.append(char)
+                                current_timestamps.append([start_time, end_time])
+                            
+                            if char in ['。', '，', '、', '！', '？', '.', ',', '!', '?'] or j == len(timestamps) - 1:
+                                sentence = ''.join(current_text).strip()
+                                if sentence and current_timestamps:
+                                    subtitle = {
+                                        "text": sentence,
+                                        "timestamps": [
+                                            current_timestamps[0][0],
+                                            current_timestamps[-1][1]
+                                        ]
+                                    }
+                                    subtitles.append(subtitle)
+                                    current_text = []
+                                    current_timestamps = []
+                    
+                    segment_result = {
+                        "text": text,
+                        "subtitles": subtitles
+                    }
+                    all_results.append(segment_result)
+                    
+                    # 发送当前片段处理完成的结果
+                    await websocket.send_json({
+                        "type": "segment_complete",
+                        "current_segment": i,
+                        "total_segments": total_segments,
+                        "segment_result": segment_result
+                    })
+                
+                # 等待一小段时间，确保串行处理
+                await asyncio.sleep(0.1)
+            
+            # 发送所有处理完成的消息
+            await websocket.send_json({
+                "type": "complete",
+                "results": all_results
+            })
+            
+    except Exception as e:
+        # 发送错误消息
+        await websocket.send_json({
+            "type": "error",
+            "message": str(e)
+        })
+    finally:
+        await websocket.close()
 
 if __name__ == "__main__":
     import uvicorn
