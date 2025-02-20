@@ -19,6 +19,7 @@ import numpy as np
 from pathlib import Path
 import tempfile
 import uuid
+import ssl
 
 
 class Language(str, Enum):
@@ -807,11 +808,19 @@ async def vip_text_alignment(
 if __name__ == "__main__":
     import uvicorn
     
+    # SSL配置
+    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ssl_context.load_cert_chain(
+        certfile="mznpy.com.pem",
+        keyfile="mznpy.com.key"
+    )
+    
     # 配置服务器启动参数
     uvicorn.run(
         "api:app",
-        host="0.0.0.0",  # 允许外部访问
-        port=5332,       # 指定端口
-        reload=True,     # 开发模式下启用热重载
-        workers=1        # 工作进程数
+        host="0.0.0.0",      # 允许外部访问
+        port=5332,           # 指定端口
+        workers=1,           # 工作进程数
+        ssl_keyfile="mznpy.com.key",    # SSL密钥文件
+        ssl_certfile="mznpy.com.pem",   # SSL证书文件
     )
