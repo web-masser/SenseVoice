@@ -3,7 +3,7 @@
 
 import os, re
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from typing_extensions import Annotated
 from typing import List, Optional, Dict
 from enum import Enum
@@ -24,7 +24,9 @@ import json
 import asyncio
 import base64
 import difflib
-
+import cv2
+from PIL import Image, ImageDraw, ImageFont
+from starlette.websockets import WebSocketDisconnect
 
 class Language(str, Enum):
     auto = "auto"
@@ -54,6 +56,9 @@ app.add_middleware(
 
 # 存储WebSocket连接
 websocket_connections: Dict[str, WebSocket] = {}
+
+# 添加 WebSocket 连接存储
+progress_connections: Dict[str, WebSocket] = {}
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -764,6 +769,277 @@ async def vip_text_alignment_ws(websocket: WebSocket):
         })
     finally:
         await websocket.close()
+
+@app.websocket("/api/v1/merge-subtitle/progress/{task_id}")
+async def merge_subtitle_progress(websocket: WebSocket, task_id: str):
+    print(f"WebSocket connection attempt for task {task_id}")
+    await websocket.accept()
+    try:
+        progress_connections[task_id] = websocket
+        print(f"WebSocket connected for task {task_id}")
+        # 发送初始进度
+        await websocket.send_json({"progress": 0})
+        print(f"Sent initial progress for task {task_id}")
+        # 保持连接直到客户端关闭
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        print(f"WebSocket disconnected for task {task_id}")
+    finally:
+        if task_id in progress_connections:
+            del progress_connections[task_id]
+            print(f"Removed WebSocket connection for task {task_id}")
+
+@app.post("/api/v1/merge-subtitle")
+async def merge_subtitle(
+    video: UploadFile,
+    srt: UploadFile,
+    position: Annotated[str, Form()] = "bottom",
+    font_size: Annotated[int, Form()] = 24,
+    x_offset: Annotated[int, Form()] = 0,
+    y_offset: Annotated[int, Form()] = 0,
+    font_color: Annotated[str, Form()] = "#FFFFFF",
+    outline_color: Annotated[str, Form()] = "#000000",
+    outline_width: Annotated[float, Form()] = 2.0,
+    task_id: Annotated[str, Form()] = None
+):
+    try:
+        task_id = task_id or str(uuid.uuid4())
+        print(f"Starting merge task with ID: {task_id}")
+        
+        # 创建临时文件夹
+        temp_dir = Path("temp")
+        temp_dir.mkdir(exist_ok=True)
+        
+        # 保存上传的文件，移除文件名中的特殊字符
+        safe_video_name = ''.join(c for c in video.filename if c.isalnum() or c in '._-')
+        video_path = temp_dir / f"{uuid.uuid4()}_{safe_video_name}"
+        srt_path = temp_dir / f"{uuid.uuid4()}.srt"
+        output_path = temp_dir / f"output_{uuid.uuid4()}.mp4"
+        final_output = temp_dir / f"final_{uuid.uuid4()}.mp4"
+        
+        try:
+            # 写入视频和字幕文件
+            video_content = await video.read()
+            srt_content = await srt.read()
+            
+            with open(str(video_path), "wb") as f:
+                f.write(video_content)
+            with open(str(srt_path), "wb") as f:
+                f.write(srt_content)
+
+            # 读取字幕文件
+            def parse_srt(srt_path):
+                with open(str(srt_path), 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                subtitles = []
+                blocks = content.strip().split('\n\n')
+                for block in blocks:
+                    lines = block.split('\n')
+                    if len(lines) >= 3:
+                        time_line = lines[1]
+                        start_time, end_time = time_line.split(' --> ')
+                        text = ' '.join(lines[2:])
+                        
+                        # 转换时间为秒
+                        def time_to_seconds(t):
+                            h, m, s = t.split(':')
+                            s, ms = s.split(',')
+                            return float(h) * 3600 + float(m) * 60 + float(s) + float(ms) / 1000
+                        
+                        subtitles.append({
+                            'start': time_to_seconds(start_time),
+                            'end': time_to_seconds(end_time),
+                            'text': text
+                        })
+                return subtitles
+
+            # 读取字幕
+            subtitles = parse_srt(srt_path)
+
+            # 读取视频
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                raise Exception("无法打开视频文件")
+
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+            # 加载字体
+            font_path = "C:\\Windows\\Fonts\\msyh.ttc"  # 使用完整路径
+            if not os.path.exists(font_path):
+                font_path = "C:\\Windows\\Fonts\\arial.ttf"  # 备选字体
+            font = ImageFont.truetype(font_path, font_size)
+
+            # 处理颜色格式
+            def hex_to_rgb(hex_color):
+                hex_color = hex_color.lstrip('#')
+                return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+            font_rgb = hex_to_rgb(font_color)
+            outline_rgb = hex_to_rgb(outline_color)
+
+            # 使用 H.264 编码器
+            temp_output = temp_dir / f"temp_{uuid.uuid4()}.mp4"
+            
+            # 先用 OpenCV 处理帧
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(str(temp_output), fourcc, fps, (width, height))
+            
+            # 处理每一帧
+            frame_count = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                # 计算并发送进度
+                progress = int((frame_count / total_frames) * 100)
+                if frame_count % 30 == 0 and task_id in progress_connections:
+                    try:
+                        print(f"Sending progress {progress}% for task {task_id}")
+                        await progress_connections[task_id].send_json({
+                            "progress": progress,
+                            "frame": frame_count,
+                            "total": total_frames
+                        })
+                        # 添加小延迟，让前端有时间处理
+                        await asyncio.sleep(0.01)
+                    except Exception as e:
+                        print(f"Error sending progress for task {task_id}: {e}")
+
+                current_time = frame_count / fps
+                
+                # 查找当前时间的字幕
+                current_text = ""
+                for sub in subtitles:
+                    if sub['start'] <= current_time <= sub['end']:
+                        current_text = sub['text']
+                        break
+
+                if current_text:
+                    # 将 OpenCV 图像转换为 PIL 图像
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    pil_img = Image.fromarray(frame_rgb)
+                    draw = ImageDraw.Draw(pil_img)
+
+                    # 计算文本大小
+                    text_bbox = draw.textbbox((0, 0), current_text, font=font)
+                    text_width = text_bbox[2] - text_bbox[0]
+                    text_height = text_bbox[3] - text_bbox[1]
+
+                    # 计算文本位置
+                    x = (width - text_width) // 2 + x_offset
+                    if position == "bottom":
+                        y = height - text_height - 50 + y_offset
+                    elif position == "top":
+                        y = 50 + y_offset
+                    else:  # middle
+                        y = (height - text_height) // 2 + y_offset
+
+                    # 绘制描边
+                    for dx, dy in [(j, i) for i in range(-int(outline_width), int(outline_width) + 1)
+                                        for j in range(-int(outline_width), int(outline_width) + 1)]:
+                        draw.text((x + dx, y + dy), current_text, font=font, fill=outline_rgb)
+
+                    # 绘制文本
+                    draw.text((x, y), current_text, font=font, fill=font_rgb)
+
+                    # 转回 OpenCV 格式
+                    frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+                # 写入帧
+                out.write(frame)
+
+                # 每处理一定数量的帧后让出控制权
+                if frame_count % 10 == 0:
+                    await asyncio.sleep(0)
+
+                frame_count += 1
+
+            # 释放资源
+            cap.release()
+            out.release()
+
+            # 使用 ffmpeg 重新编码，确保使用兼容的编码器
+            cmd = [
+                'ffmpeg',
+                '-i', str(temp_output),
+                '-i', str(video_path),
+                '-c:v', 'libx264',  # 使用 H.264 编码
+                '-preset', 'medium',
+                '-crf', '23',       # 控制视频质量
+                '-c:a', 'aac',      # 音频编码
+                '-strict', 'experimental',
+                '-map', '0:v:0',
+                '-map', '1:a:0?',
+                '-y',
+                str(final_output)
+            ]
+            
+            process = subprocess.run(cmd, capture_output=True, text=True)
+            if process.returncode != 0:
+                raise Exception(f"FFmpeg error: {process.stderr}")
+
+            # 读取最终输出文件
+            with open(str(final_output), "rb") as f:
+                video_data = f.read()
+
+            # 发送100%进度
+            if task_id in progress_connections:
+                try:
+                    await progress_connections[task_id].send_json({
+                        "progress": 100,
+                        "frame": total_frames,
+                        "total": total_frames
+                    })
+                except Exception as e:
+                    print(f"Error sending final progress: {e}")
+
+            # 返回处理后的视频
+            return Response(
+                content=video_data,
+                media_type="video/mp4",
+                headers={
+                    "Content-Disposition": f"attachment; filename=output_{safe_video_name}"
+                }
+            )
+            
+        finally:
+            # 清理临时文件
+            for file in [video_path, srt_path, output_path, final_output]:
+                try:
+                    if file.exists():
+                        file.unlink()
+                except Exception as e:
+                    print(f"Error deleting {file}: {e}")
+            
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+def get_video_info(video_path: str) -> dict:
+    """获取视频信息"""
+    cmd = [
+        'ffprobe',
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height',
+        '-of', 'json',
+        video_path
+    ]
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"FFprobe error: {result.stderr}")
+    
+    info = json.loads(result.stdout)
+    return info.get('streams', [{}])[0]
 
 if __name__ == "__main__":
     import uvicorn
