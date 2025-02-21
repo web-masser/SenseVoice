@@ -1131,6 +1131,165 @@ def calculate_position(width, height, text_width, text_height, horizontal_positi
     
     return x, y
 
+@app.post("/api/v1/add-watermark")
+async def add_watermark(
+    video: UploadFile,
+    watermark_text: Annotated[str, Form()],
+    watermark_size: Annotated[int, Form()] = 24,
+    watermark_color: Annotated[str, Form()] = "FFFFFF",
+    watermark_opacity: Annotated[int, Form()] = 50,
+    watermark_position: Annotated[str, Form()] = "bottom-right",
+    padding: Annotated[int, Form()] = 20,
+    task_id: Annotated[str, Form()] = None
+):
+    try:
+        # 创建临时文件
+        video_path = Path(tempfile.gettempdir()) / f"input_{uuid.uuid4()}.mp4"
+        output_path = Path(tempfile.gettempdir()) / f"output_{uuid.uuid4()}.mp4"
+        final_output = Path(tempfile.gettempdir()) / f"final_{uuid.uuid4()}.mp4"
+
+        # 保存上传的视频
+        with open(video_path, "wb") as buffer:
+            content = await video.read()
+            buffer.write(content)
+
+        # 获取视频信息
+        cap = cv2.VideoCapture(str(video_path))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # 创建输出视频
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+
+        # 加载字体
+        font_path = "C:\\Windows\\Fonts\\msyh.ttc"
+        if not os.path.exists(font_path):
+            font_path = "C:\\Windows\\Fonts\\arial.ttf"
+        font = ImageFont.truetype(font_path, watermark_size)
+
+        # 处理颜色和透明度
+        watermark_rgb = tuple(int(watermark_color[i:i+2], 16) for i in (0, 2, 4))
+        watermark_alpha = int(watermark_opacity * 255 / 100)
+        watermark_rgba = (*watermark_rgb, watermark_alpha)
+
+        frame_count = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # 转换为PIL图像
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(frame_rgb)
+            draw = ImageDraw.Draw(pil_img)
+
+            # 计算水印文本大小
+            text_bbox = draw.textbbox((0, 0), watermark_text, font=font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+
+            # 计算水印位置
+            if watermark_position == "top-left":
+                x, y = padding, padding
+            elif watermark_position == "top-right":
+                x = width - text_width - padding
+                y = padding
+            elif watermark_position == "bottom-left":
+                x = padding
+                y = height - text_height - padding
+            else:  # bottom-right
+                x = width - text_width - padding
+                y = height - text_height - padding
+
+            # 绘制水印
+            draw.text((x, y), watermark_text, font=font, fill=watermark_rgba)
+
+            # 转回OpenCV格式
+            frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            out.write(frame)
+
+            # 更新进度
+            frame_count += 1
+            if task_id in progress_connections:
+                try:
+                    await progress_connections[task_id].send_json({
+                        "progress": int(frame_count * 100 / total_frames),
+                        "frame": frame_count,
+                        "total": total_frames
+                    })
+                except Exception as e:
+                    print(f"Error sending progress: {e}")
+
+            # 每处理一定数量的帧后让出控制权
+            if frame_count % 10 == 0:
+                await asyncio.sleep(0)
+
+        # 释放资源
+        cap.release()
+        out.release()
+
+        # 使用ffmpeg重新编码
+        cmd = [
+            'ffmpeg',
+            '-i', str(output_path),
+            '-i', str(video_path),
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-strict', 'experimental',
+            '-map', '0:v:0',
+            '-map', '1:a:0?',
+            '-y',
+            str(final_output)
+        ]
+        
+        process = subprocess.run(cmd, capture_output=True, text=True)
+        if process.returncode != 0:
+            raise Exception(f"FFmpeg error: {process.stderr}")
+
+        # 读取最终输出文件
+        with open(str(final_output), "rb") as f:
+            video_data = f.read()
+
+        # 发送100%进度
+        if task_id in progress_connections:
+            try:
+                await progress_connections[task_id].send_json({
+                    "progress": 100,
+                    "frame": total_frames,
+                    "total": total_frames
+                })
+            except Exception as e:
+                print(f"Error sending final progress: {e}")
+
+        # 返回处理后的视频
+        return Response(
+            content=video_data,
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f"attachment; filename=watermark_{video.filename}"
+            }
+        )
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+    finally:
+        # 清理临时文件
+        for file in [video_path, output_path, final_output]:
+            try:
+                if file.exists():
+                    file.unlink()
+            except Exception as e:
+                print(f"Error deleting {file}: {e}")
+
 if __name__ == "__main__":
     import uvicorn
     
