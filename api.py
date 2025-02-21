@@ -796,9 +796,10 @@ async def merge_subtitle_progress(websocket: WebSocket, task_id: str):
 async def merge_subtitle(
     video: UploadFile,
     srt: UploadFile,
-    position: Annotated[str, Form()] = "bottom",
+    horizontal_position: Annotated[str, Form()] = "center",
+    vertical_position: Annotated[str, Form()] = "bottom",
     font_size: Annotated[int, Form()] = 24,
-    font_weight: Annotated[str, Form()] = "400",
+    font_weight: Annotated[str, Form()] = "normal",
     font_color: Annotated[str, Form()] = "FFFFFF",
     font_opacity: Annotated[int, Form()] = 100,
     outline_color: Annotated[str, Form()] = "000000",
@@ -810,6 +811,7 @@ async def merge_subtitle(
     line_height: Annotated[float, Form()] = 1.5,
     background_color: Annotated[str, Form()] = "000000",
     background_blur: Annotated[int, Form()] = 0,
+    font_family: Annotated[str, Form()] = "msyh",
     task_id: Annotated[str, Form()] = None
 ):
     try:
@@ -877,11 +879,46 @@ async def merge_subtitle(
             fps = cap.get(cv2.CAP_PROP_FPS)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-            # 加载字体
-            font_path = "C:\\Windows\\Fonts\\msyh.ttc"  # 使用完整路径
+            # 计算字体大小缩放因子
+            PREVIEW_WIDTH = 1000
+            scale_factor = (width / PREVIEW_WIDTH) * 2.5  # 增加2.5倍的基础缩放
+            
+            # 调整字体大小
+            adjusted_font_size = int(font_size * scale_factor)
+            
+            # 字体映射
+            FONT_PATHS = {
+                'msyh': "C:\\Windows\\Fonts\\msyh.ttc",     # 微软雅黑
+                'simsun': "C:\\Windows\\Fonts\\simsun.ttc", # 宋体
+                'simhei': "C:\\Windows\\Fonts\\simhei.ttf", # 黑体
+                'kaiti': "C:\\Windows\\Fonts\\simkai.ttf",  # 楷体
+                'arial': "C:\\Windows\\Fonts\\arial.ttf",    # Arial
+            }
+
+            # 字重映射
+            FONT_WEIGHTS = {
+                'normal': 400,
+                'bold': 700
+            }
+
+            # 选择字体文件
+            font_path = FONT_PATHS.get(font_family, FONT_PATHS['msyh'])
             if not os.path.exists(font_path):
-                font_path = "C:\\Windows\\Fonts\\arial.ttf"  # 备选字体
-            font = ImageFont.truetype(font_path, font_size)
+                font_path = FONT_PATHS['msyh']  # 默认回退到微软雅黑
+
+            # 加载字体
+            try:
+                font = ImageFont.truetype(font_path, adjusted_font_size)
+                # 尝试设置字重（如果字体支持）
+                weight = FONT_WEIGHTS.get(font_weight, 400)
+                try:
+                    font = font.font_variant(weight=weight)
+                except Exception:
+                    print(f"Font weight not supported for {font_family}")
+            except Exception as e:
+                print(f"Error loading font {font_family}, falling back to default: {e}")
+                # 回退到默认字体
+                font = ImageFont.truetype(FONT_PATHS['msyh'], adjusted_font_size)
 
             # 处理字体设置
             font_rgb = tuple(int(font_color[i:i+2], 16) for i in (0, 2, 4))
@@ -940,45 +977,43 @@ async def merge_subtitle(
                     pil_img = Image.fromarray(frame_rgb)
                     draw = ImageDraw.Draw(pil_img)
 
-                    # 应用字体设置
-                    font = font.font_variant(weight=int(font_weight))
-                    
-                    # 计算文本大小（考虑字间距）
+                    # 计算文本大小时使用调整后的字体大小
                     text_with_spacing = "".join([c + " " * int(letter_spacing) for c in current_text]).strip()
                     text_bbox = draw.textbbox((0, 0), text_with_spacing, font=font)
                     text_width = text_bbox[2] - text_bbox[0]
                     text_height = text_bbox[3] - text_bbox[1]
 
-                    # 计算文本位置
-                    x = (width - text_width) // 2 + x_offset
-                    if position == "bottom":
-                        y = height - text_height - 50 + y_offset
-                    elif position == "top":
-                        y = 50 + y_offset
-                    else:  # middle
-                        y = (height - text_height) // 2 + y_offset
+                    # 计算位置
+                    x, y = calculate_position(
+                        width, height,
+                        text_width, text_height,
+                        horizontal_position, vertical_position,
+                        x_offset, y_offset
+                    )
 
-                    # 如果启用背景模糊
+                    # 如果启用背景模糊，先应用模糊效果
                     if background_blur > 0:
-                        # 创建背景区域
-                        bg_area = frame[
-                            max(0, y-10):min(height, y+text_height+10),
-                            max(0, x-10):min(width, x+text_width+10)
-                        ]
-                        # 应用高斯模糊
-                        blurred = cv2.GaussianBlur(bg_area, (background_blur*2+1, background_blur*2+1), 0)
-                        frame[
-                            max(0, y-10):min(height, y+text_height+10),
-                            max(0, x-10):min(width, x+text_width+10)
-                        ] = blurred
+                        padding = 20  # 文字周围的额外模糊区域
+                        bg_y1 = max(0, y - padding)
+                        bg_y2 = min(height, y + text_height + padding)
+                        bg_x1 = max(0, x - padding)
+                        bg_x2 = min(width, x + text_width + padding)
+                        
+                        bg_area = frame[bg_y1:bg_y2, bg_x1:bg_x2]
+                        if bg_area.size > 0:  # 确保区域有效
+                            blurred = cv2.GaussianBlur(bg_area, (background_blur*2+1, background_blur*2+1), 0)
+                            frame[bg_y1:bg_y2, bg_x1:bg_x2] = blurred
 
-                    # 绘制描边
-                    for dx, dy in [(j, i) for i in range(-int(outline_width), int(outline_width) + 1)
-                                        for j in range(-int(outline_width), int(outline_width) + 1)]:
-                        draw.text((x + dx, y + dy), text_with_spacing, font=font, fill=outline_rgb)
+                    # 绘制描边（如果启用）
+                    if outline_width > 0:
+                        outline_rgba = (*outline_rgb[:3], int(outline_rgb[3] * outline_opacity / 100))
+                        for dx, dy in [(j, i) for i in range(-int(outline_width), int(outline_width) + 1)
+                                            for j in range(-int(outline_width), int(outline_width) + 1)]:
+                            draw.text((x + dx, y + dy), text_with_spacing, font=font, fill=outline_rgba)
 
                     # 绘制文本
-                    draw.text((x, y), text_with_spacing, font=font, fill=font_rgb)
+                    font_rgba = (*font_rgb[:3], int(font_rgb[3] * font_opacity / 100))
+                    draw.text((x, y), text_with_spacing, font=font, fill=font_rgba)
 
                     # 转回 OpenCV 格式
                     frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
@@ -1072,6 +1107,29 @@ def get_video_info(video_path: str) -> dict:
     
     info = json.loads(result.stdout)
     return info.get('streams', [{}])[0]
+
+def calculate_position(width, height, text_width, text_height, horizontal_position, vertical_position, x_offset, y_offset):
+    # 水平位置计算
+    if horizontal_position == "center":
+        x = (width - text_width) // 2
+    elif horizontal_position == "right":
+        x = width - text_width - int(width * 0.1)  # 10% 边距
+    else:  # left
+        x = int(width * 0.1)  # 10% 边距
+
+    # 垂直位置计算
+    if vertical_position == "bottom":
+        y = height - text_height - int(height * 0.1)  # 10% 边距
+    elif vertical_position == "middle":
+        y = (height - text_height) // 2
+    else:  # top
+        y = int(height * 0.1)  # 10% 边距
+
+    # 应用偏移
+    x += x_offset
+    y += y_offset
+    
+    return x, y
 
 if __name__ == "__main__":
     import uvicorn
