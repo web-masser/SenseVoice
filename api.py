@@ -777,18 +777,20 @@ async def merge_subtitle_progress(websocket: WebSocket, task_id: str):
     try:
         progress_connections[task_id] = websocket
         print(f"WebSocket connected for task {task_id}")
-        # 发送初始进度
         await websocket.send_json({"progress": 0})
-        print(f"Sent initial progress for task {task_id}")
-        # 保持连接直到客户端关闭
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        print(f"WebSocket disconnected for task {task_id}")
+        
+        try:
+            while True:
+                await websocket.receive_text()
+                await asyncio.sleep(0.1)  # 添加小延迟防止过快循环
+        except WebSocketDisconnect:
+            print(f"WebSocket disconnected normally for task {task_id}")
+        except Exception as e:
+            print(f"WebSocket error for task {task_id}: {e}")
     finally:
         if task_id in progress_connections:
             del progress_connections[task_id]
-            print(f"Removed WebSocket connection for task {task_id}")
+            print(f"Cleaned up connection for task {task_id}")
 
 @app.post("/api/v1/merge-subtitle")
 async def merge_subtitle(
