@@ -798,11 +798,18 @@ async def merge_subtitle(
     srt: UploadFile,
     position: Annotated[str, Form()] = "bottom",
     font_size: Annotated[int, Form()] = 24,
+    font_weight: Annotated[str, Form()] = "400",
+    font_color: Annotated[str, Form()] = "FFFFFF",
+    font_opacity: Annotated[int, Form()] = 100,
+    outline_color: Annotated[str, Form()] = "000000",
+    outline_width: Annotated[float, Form()] = 2.0,
+    outline_opacity: Annotated[int, Form()] = 100,
     x_offset: Annotated[int, Form()] = 0,
     y_offset: Annotated[int, Form()] = 0,
-    font_color: Annotated[str, Form()] = "#FFFFFF",
-    outline_color: Annotated[str, Form()] = "#000000",
-    outline_width: Annotated[float, Form()] = 2.0,
+    letter_spacing: Annotated[float, Form()] = 0,
+    line_height: Annotated[float, Form()] = 1.5,
+    background_color: Annotated[str, Form()] = "000000",
+    background_blur: Annotated[int, Form()] = 0,
     task_id: Annotated[str, Form()] = None
 ):
     try:
@@ -876,13 +883,18 @@ async def merge_subtitle(
                 font_path = "C:\\Windows\\Fonts\\arial.ttf"  # 备选字体
             font = ImageFont.truetype(font_path, font_size)
 
-            # 处理颜色格式
-            def hex_to_rgb(hex_color):
-                hex_color = hex_color.lstrip('#')
-                return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+            # 处理字体设置
+            font_rgb = tuple(int(font_color[i:i+2], 16) for i in (0, 2, 4))
+            font_alpha = int(font_opacity * 255 / 100)
+            font_rgb += (font_alpha,)  # 添加透明度
 
-            font_rgb = hex_to_rgb(font_color)
-            outline_rgb = hex_to_rgb(outline_color)
+            # 处理描边设置
+            outline_rgb = tuple(int(outline_color[i:i+2], 16) for i in (0, 2, 4))
+            outline_alpha = int(outline_opacity * 255 / 100)
+            outline_rgb += (outline_alpha,)  # 添加透明度
+
+            # 处理背景颜色
+            bg_rgb = tuple(int(background_color[i:i+2], 16) for i in (0, 2, 4))
 
             # 使用 H.264 编码器
             temp_output = temp_dir / f"temp_{uuid.uuid4()}.mp4"
@@ -928,8 +940,12 @@ async def merge_subtitle(
                     pil_img = Image.fromarray(frame_rgb)
                     draw = ImageDraw.Draw(pil_img)
 
-                    # 计算文本大小
-                    text_bbox = draw.textbbox((0, 0), current_text, font=font)
+                    # 应用字体设置
+                    font = font.font_variant(weight=int(font_weight))
+                    
+                    # 计算文本大小（考虑字间距）
+                    text_with_spacing = "".join([c + " " * int(letter_spacing) for c in current_text]).strip()
+                    text_bbox = draw.textbbox((0, 0), text_with_spacing, font=font)
                     text_width = text_bbox[2] - text_bbox[0]
                     text_height = text_bbox[3] - text_bbox[1]
 
@@ -942,13 +958,27 @@ async def merge_subtitle(
                     else:  # middle
                         y = (height - text_height) // 2 + y_offset
 
+                    # 如果启用背景模糊
+                    if background_blur > 0:
+                        # 创建背景区域
+                        bg_area = frame[
+                            max(0, y-10):min(height, y+text_height+10),
+                            max(0, x-10):min(width, x+text_width+10)
+                        ]
+                        # 应用高斯模糊
+                        blurred = cv2.GaussianBlur(bg_area, (background_blur*2+1, background_blur*2+1), 0)
+                        frame[
+                            max(0, y-10):min(height, y+text_height+10),
+                            max(0, x-10):min(width, x+text_width+10)
+                        ] = blurred
+
                     # 绘制描边
                     for dx, dy in [(j, i) for i in range(-int(outline_width), int(outline_width) + 1)
                                         for j in range(-int(outline_width), int(outline_width) + 1)]:
-                        draw.text((x + dx, y + dy), current_text, font=font, fill=outline_rgb)
+                        draw.text((x + dx, y + dy), text_with_spacing, font=font, fill=outline_rgb)
 
                     # 绘制文本
-                    draw.text((x, y), current_text, font=font, fill=font_rgb)
+                    draw.text((x, y), text_with_spacing, font=font, fill=font_rgb)
 
                     # 转回 OpenCV 格式
                     frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
