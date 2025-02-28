@@ -27,6 +27,7 @@ import difflib
 import cv2
 from PIL import Image, ImageDraw, ImageFont
 from starlette.websockets import WebSocketDisconnect
+from funasr import AutoModel
 
 class Language(str, Enum):
     auto = "auto"
@@ -1289,6 +1290,67 @@ async def add_watermark(
                     file.unlink()
             except Exception as e:
                 print(f"Error deleting {file}: {e}")
+
+
+ # 使用模型进行音频解析
+model = AutoModel(
+    model=model_dir,
+    trust_remote_code=True,
+    remote_code="./model.py",
+    vad_model="fsmn-vad",
+    vad_kwargs={"max_single_segment_time": 30000},
+    device="cuda:0",
+    ban_emo_unk=True,
+)
+
+
+@app.post("/api/v1/parse-audio")
+async def parse_audio(file: UploadFile):
+    """
+    解析音频文件接口
+    - file: 音频文件(mp3)
+    """
+    try:
+        # 读取音频文件
+        content = await file.read()
+        audio_io = BytesIO(content)
+
+       
+        res = model.generate(
+            input=audio_io,
+            cache={},
+            language="auto",
+            use_itn=True,
+            batch_size_s=60,
+            merge_vad=True,
+            merge_length_s=15,
+            ban_emo_unk=True,
+        )
+        
+        # 处理返回结果，去除多余符号和表情
+        text = rich_transcription_postprocess(res[0]["text"])
+        cleaned_text = clean_text(text)  # 调用清理函数
+        
+        return {
+            "success": True,
+            "text": cleaned_text,
+            "result": res
+        }
+
+    except Exception as e:
+        print(f"Error: {str(e)}")  # 添加错误日志
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+def clean_text(text: str) -> str:
+    """
+    清理文本，去除多余符号和表情
+    """
+    # 使用正则表达式去除所有表情符号，保留中文和常见标点符号
+    cleaned = re.sub(r'[^\w\s,.!?，。！？\u4e00-\u9fa5]', '', text)  # 保留中文字符
+    return cleaned.strip()  # 去除首尾空格
 
 if __name__ == "__main__":
     import uvicorn
