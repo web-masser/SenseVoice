@@ -28,6 +28,7 @@ import cv2
 from PIL import Image, ImageDraw, ImageFont
 from starlette.websockets import WebSocketDisconnect
 from funasr import AutoModel
+import ffmpeg
 
 class Language(str, Enum):
     auto = "auto"
@@ -1313,11 +1314,40 @@ async def parse_audio(file: UploadFile):
     try:
         # 读取音频文件
         content = await file.read()
-        audio_io = BytesIO(content)
+        
+        # 获取文件扩展名
+        file_extension = os.path.splitext(file.filename)[1]
+        if not file_extension:
+            file_extension = '.mp4'  # 默认扩展名
+            
+        # 创建临时文件
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
+            temp_file.write(content)
+            original_path = temp_file.name
 
-       
+        # 创建截取后的临时文件路径
+        trimmed_path = original_path.replace(file_extension, f'_trimmed{file_extension}')
+        
+        # 使用 ffmpeg 截取并处理音频
+        out, _ = (
+            ffmpeg
+            .input(original_path)
+            .filter('atrim', duration=20)  # 截取前30秒
+            .output(trimmed_path,
+                    ar='16000',  # 采样率
+                    ac='1',      # 单声道
+                    format='wav',
+                    acodec='pcm_s16le',  # 使用16位PCM编码
+                    audio_bitrate='64k',  # 降低比特率
+                    compression_level='5'  # 压缩级别
+            )
+            .overwrite_output()
+            .run(capture_stdout=True, capture_stderr=True)
+        )
+
+        # 使用处理后的文件调用模型
         res = model.generate(
-            input=audio_io,
+            input=trimmed_path,
             cache={},
             language="auto",
             use_itn=True,
@@ -1327,9 +1357,9 @@ async def parse_audio(file: UploadFile):
             ban_emo_unk=True,
         )
         
-        # 处理返回结果，去除多余符号和表情
+        # 处理返回结果
         text = rich_transcription_postprocess(res[0]["text"])
-        cleaned_text = clean_text(text)  # 调用清理函数
+        cleaned_text = clean_text(text)
         
         return {
             "success": True,
@@ -1338,11 +1368,21 @@ async def parse_audio(file: UploadFile):
         }
 
     except Exception as e:
-        print(f"Error: {str(e)}")  # 添加错误日志
+        print(f"Error: {str(e)}")
         return JSONResponse(
             status_code=500,
             content={"error": str(e)}
         )
+    
+    finally:
+        # 清理临时文件
+        try:
+            if os.path.exists(original_path):
+                os.unlink(original_path)
+            if os.path.exists(trimmed_path):
+                os.unlink(trimmed_path)
+        except Exception as e:
+            print(f"Error deleting temporary files: {e}")
 
 def clean_text(text: str) -> str:
     """
