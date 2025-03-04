@@ -30,6 +30,7 @@ from starlette.websockets import WebSocketDisconnect
 from funasr import AutoModel
 import ffmpeg
 import traceback
+import aiofiles
 
 class Language(str, Enum):
     auto = "auto"
@@ -886,317 +887,239 @@ async def merge_subtitle_progress(websocket: WebSocket, task_id: str):
 async def merge_subtitle(
     video: UploadFile,
     srt: UploadFile,
-    horizontal_position: Annotated[str, Form()] = "center",
-    vertical_position: Annotated[str, Form()] = "bottom",
-    font_size: Annotated[int, Form()] = 24,
-    font_weight: Annotated[str, Form()] = "normal",
-    font_color: Annotated[str, Form()] = "FFFFFF",
-    font_opacity: Annotated[int, Form()] = 100,
-    outline_color: Annotated[str, Form()] = "000000",
-    outline_width: Annotated[float, Form()] = 2.0,
-    outline_opacity: Annotated[int, Form()] = 100,
-    x_offset: Annotated[int, Form()] = 0,
-    y_offset: Annotated[int, Form()] = 0,
-    letter_spacing: Annotated[float, Form()] = 0,
-    line_height: Annotated[float, Form()] = 1.5,
-    background_color: Annotated[str, Form()] = "000000",
-    background_blur: Annotated[int, Form()] = 0,
-    font_family: Annotated[str, Form()] = "msyh",
-    task_id: Annotated[str, Form()] = None
+    horizontal_position: str = Form(...),
+    vertical_position: str = Form(...),
+    font_size: int = Form(...),
+    font_color: str = Form(...),
+    font_weight: str = Form(...),
+    task_id: str = Form(None)
 ):
     try:
-        task_id = task_id or str(uuid.uuid4())
-        print(f"Starting merge task with ID: {task_id}")
+        print(f"\n=== 开始处理字幕合成请求 ===")
+        print(f"参数信息:")
+        print(f"- 水平位置: {horizontal_position}")
+        print(f"- 垂直位置: {vertical_position}")
+        print(f"- 字体大小: {font_size}")
+        print(f"- 字体颜色: {font_color}")
+        print(f"- 字体粗细: {font_weight}")
         
-        # 创建临时文件夹
-        temp_dir = Path("temp")
+        # 使用绝对路径
+        temp_dir = Path.cwd() / "temp"
         temp_dir.mkdir(exist_ok=True)
         
-        # 保存上传的文件，移除文件名中的特殊字符
-        safe_video_name = ''.join(c for c in video.filename if c.isalnum() or c in '._-')
-        video_path = temp_dir / f"{uuid.uuid4()}_{safe_video_name}"
-        srt_path = temp_dir / f"{uuid.uuid4()}.srt"
+        # 保存上传的文件
+        video_path = temp_dir / f"input_{uuid.uuid4()}.mp4"
+        srt_path = temp_dir / f"subtitle_{uuid.uuid4()}.srt"
         output_path = temp_dir / f"output_{uuid.uuid4()}.mp4"
-        final_output = temp_dir / f"final_{uuid.uuid4()}.mp4"
         
-        try:
-            # 写入视频和字幕文件
-            video_content = await video.read()
-            srt_content = await srt.read()
-            
-            with open(str(video_path), "wb") as f:
-                f.write(video_content)
-            with open(str(srt_path), "wb") as f:
-                f.write(srt_content)
-
-            # 读取字幕文件
-            def parse_srt(srt_path):
-                with open(str(srt_path), 'r', encoding='utf-8') as f:
-                    content = f.read()
-                
-                subtitles = []
-                blocks = content.strip().split('\n\n')
-                for block in blocks:
-                    lines = block.split('\n')
-                    if len(lines) >= 3:
-                        time_line = lines[1]
-                        start_time, end_time = time_line.split(' --> ')
-                        text = ' '.join(lines[2:])
-                        
-                        # 转换时间为秒
-                        def time_to_seconds(t):
-                            h, m, s = t.split(':')
-                            s, ms = s.split(',')
-                            return float(h) * 3600 + float(m) * 60 + float(s) + float(ms) / 1000
-                        
-                        subtitles.append({
-                            'start': time_to_seconds(start_time),
-                            'end': time_to_seconds(end_time),
-                            'text': text
-                        })
-                return subtitles
-
-            # 读取字幕
-            subtitles = parse_srt(srt_path)
-
-            # 读取视频
-            cap = cv2.VideoCapture(str(video_path))
-            if not cap.isOpened():
-                raise Exception("无法打开视频文件")
-
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-            # 计算字体大小缩放因子
-            PREVIEW_WIDTH = 1000
-            scale_factor = (width / PREVIEW_WIDTH) * 2.5  # 增加2.5倍的基础缩放
-            
-            # 调整字体大小
-            adjusted_font_size = int(font_size * scale_factor)
-            
-            # 字体映射
-            FONT_PATHS = {
-                'msyh': "C:\\Windows\\Fonts\\msyh.ttc",     # 微软雅黑
-                'simsun': "C:\\Windows\\Fonts\\simsun.ttc", # 宋体
-                'simhei': "C:\\Windows\\Fonts\\simhei.ttf", # 黑体
-                'kaiti': "C:\\Windows\\Fonts\\simkai.ttf",  # 楷体
-                'arial': "C:\\Windows\\Fonts\\arial.ttf",    # Arial
-            }
-
-            # 字重映射
-            FONT_WEIGHTS = {
-                'normal': 400,
-                'bold': 700
-            }
-
-            # 选择字体文件
-            font_path = FONT_PATHS.get(font_family, FONT_PATHS['msyh'])
-            if not os.path.exists(font_path):
-                font_path = FONT_PATHS['msyh']  # 默认回退到微软雅黑
-
-            # 加载字体
-            try:
-                font = ImageFont.truetype(font_path, adjusted_font_size)
-                # 尝试设置字重（如果字体支持）
-                weight = FONT_WEIGHTS.get(font_weight, 400)
-                try:
-                    font = font.font_variant(weight=weight)
-                except Exception:
-                    print(f"Font weight not supported for {font_family}")
-            except Exception as e:
-                print(f"Error loading font {font_family}, falling back to default: {e}")
-                # 回退到默认字体
-                font = ImageFont.truetype(FONT_PATHS['msyh'], adjusted_font_size)
-
-            # 处理字体设置
-            font_rgb = tuple(int(font_color[i:i+2], 16) for i in (0, 2, 4))
-            font_alpha = int(font_opacity * 255 / 100)
-            font_rgb += (font_alpha,)  # 添加透明度
-
-            # 处理描边设置
-            outline_rgb = tuple(int(outline_color[i:i+2], 16) for i in (0, 2, 4))
-            outline_alpha = int(outline_opacity * 255 / 100)
-            outline_rgb += (outline_alpha,)  # 添加透明度
-
-            # 处理背景颜色
-            bg_rgb = tuple(int(background_color[i:i+2], 16) for i in (0, 2, 4))
-
-            # 使用 H.264 编码器
-            temp_output = temp_dir / f"temp_{uuid.uuid4()}.mp4"
-            
-            # 先用 OpenCV 处理帧
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(str(temp_output), fourcc, fps, (width, height))
-            
-            # 处理每一帧
-            frame_count = 0
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                # 计算并发送进度
-                progress = int((frame_count / total_frames) * 100)
-                if frame_count % 30 == 0 and task_id in progress_connections:
-                    try:
-                        print(f"Sending progress {progress}% for task {task_id}")
-                        await progress_connections[task_id].send_json({
-                            "progress": progress,
-                            "frame": frame_count,
-                            "total": total_frames
-                        })
-                        # 添加小延迟，让前端有时间处理
-                        await asyncio.sleep(0.01)
-                    except Exception as e:
-                        print(f"Error sending progress for task {task_id}: {e}")
-
-                current_time = frame_count / fps
-                
-                # 查找当前时间的字幕
-                current_text = ""
-                for sub in subtitles:
-                    if sub['start'] <= current_time <= sub['end']:
-                        current_text = sub['text']
-                        break
-
-                if current_text:
-                    # 将 OpenCV 图像转换为 PIL 图像
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    pil_img = Image.fromarray(frame_rgb)
-                    draw = ImageDraw.Draw(pil_img)
-
-                    # 计算文本大小时使用调整后的字体大小
-                    text_with_spacing = "".join([c + " " * int(letter_spacing) for c in current_text]).strip()
-                    text_bbox = draw.textbbox((0, 0), text_with_spacing, font=font)
-                    text_width = text_bbox[2] - text_bbox[0]
-                    text_height = text_bbox[3] - text_bbox[1]
-
-                    # 计算位置
-                    x, y = calculate_position(
-                        width, height,
-                        text_width, text_height,
-                        horizontal_position, vertical_position,
-                        x_offset, y_offset
-                    )
-
-                    # 如果启用背景模糊，先应用模糊效果
-                    if background_blur > 0:
-                        padding = 20  # 文字周围的额外模糊区域
-                        bg_y1 = max(0, y - padding)
-                        bg_y2 = min(height, y + text_height + padding)
-                        bg_x1 = max(0, x - padding)
-                        bg_x2 = min(width, x + text_width + padding)
-                        
-                        bg_area = frame[bg_y1:bg_y2, bg_x1:bg_x2]
-                        if bg_area.size > 0:  # 确保区域有效
-                            blurred = cv2.GaussianBlur(bg_area, (background_blur*2+1, background_blur*2+1), 0)
-                            frame[bg_y1:bg_y2, bg_x1:bg_x2] = blurred
-
-                    # 绘制描边（如果启用）
-                    if outline_width > 0:
-                        outline_rgba = (*outline_rgb[:3], int(outline_rgb[3] * outline_opacity / 100))
-                        for dx, dy in [(j, i) for i in range(-int(outline_width), int(outline_width) + 1)
-                                            for j in range(-int(outline_width), int(outline_width) + 1)]:
-                            draw.text((x + dx, y + dy), text_with_spacing, font=font, fill=outline_rgba)
-
-                    # 绘制文本
-                    font_rgba = (*font_rgb[:3], int(font_rgb[3] * font_opacity / 100))
-                    draw.text((x, y), text_with_spacing, font=font, fill=font_rgba)
-
-                    # 转回 OpenCV 格式
-                    frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-
-                # 写入帧
-                out.write(frame)
-
-                # 每处理一定数量的帧后让出控制权
-                if frame_count % 10 == 0:
-                    await asyncio.sleep(0)
-
-                frame_count += 1
-
-            # 释放资源
-            cap.release()
-            out.release()
-
-            # 使用 ffmpeg 重新编码，确保使用兼容的编码器
+        print(f"\n保存临时文件:")
+        print(f"- 视频: {video_path}")
+        print(f"- 字幕: {srt_path}")
+        print(f"- 输出: {output_path}")
+        
+        # 写入文件
+        async with aiofiles.open(video_path, 'wb') as f:
+            content = await video.read()
+            await f.write(content)
+        
+        async with aiofiles.open(srt_path, 'wb') as f:
+            content = await srt.read()
+            await f.write(content)
+        
+        # 确保文件存在
+        if not video_path.exists() or not srt_path.exists():
+            raise Exception("临时文件创建失败")
+        
+        # 计算字幕位置
+        vertical_align = "10" if vertical_position == "top" else "main_h-text_h-10"
+        horizontal_align = {
+            "left": "10",
+            "center": "(main_w-text_w)/2",
+            "right": "main_w-text_w-10"
+        }[horizontal_position]
+        
+        # 计算对齐值
+        def get_alignment():
+            if vertical_position == 'top':
+                if horizontal_position == 'left': return 7
+                if horizontal_position == 'center': return 8
+                return 9  # right
+            else:  # bottom
+                if horizontal_position == 'left': return 1
+                if horizontal_position == 'center': return 2
+                return 3  # right
+        
+        # 处理路径，确保使用正确的路径分隔符和转义
+        video_path_str = str(video_path.absolute()).replace('\\', '\\\\')
+        srt_path_str = str(srt_path.absolute()).replace('\\', '\\\\')
+        output_path_str = str(output_path.absolute()).replace('\\', '\\\\')
+        
+        # 获取视频信息
+        def get_video_info(video_path: str) -> dict:
+            """获取视频信息"""
             cmd = [
-                'ffmpeg',
-                '-i', str(temp_output),
-                '-i', str(video_path),
-                '-c:v', 'libx264',  # 使用 H.264 编码
-                '-preset', 'medium',
-                '-crf', '23',       # 控制视频质量
-                '-c:a', 'aac',      # 音频编码
-                '-strict', 'experimental',
-                '-map', '0:v:0',
-                '-map', '1:a:0?',
-                '-y',
-                str(final_output)
+                'ffprobe',
+                '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height',
+                '-of', 'json',
+                video_path
             ]
             
-            process = subprocess.run(cmd, capture_output=True, text=True)
-            if process.returncode != 0:
-                raise Exception(f"FFmpeg error: {process.stderr}")
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise Exception(f"FFprobe error: {result.stderr}")
+            
+            info = json.loads(result.stdout)
+            return info.get('streams', [{}])[0]
 
-            # 读取最终输出文件
-            with open(str(final_output), "rb") as f:
-                video_data = f.read()
+        # 在处理视频之前，先获取视频信息
+        video_info = get_video_info(video_path_str)
+        width = video_info.get('width', 0)
+        height = video_info.get('height', 0)
 
-            # 发送100%进度
-            if task_id in progress_connections:
-                try:
-                    await progress_connections[task_id].send_json({
-                        "progress": 100,
-                        "frame": total_frames,
-                        "total": total_frames
+        if not width or not height:
+            raise Exception("无法获取视频尺寸信息")
+
+        # 读取 SRT 文件内容并解析时间戳和文本
+        def parse_srt(srt_path):
+            with open(srt_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            subtitle_blocks = content.strip().split('\n\n')
+            subtitles = []
+            
+            for block in subtitle_blocks:
+                lines = block.strip().split('\n')
+                if len(lines) >= 3:
+                    # 解析时间戳
+                    times = lines[1].split(' --> ')
+                    start_time = times[0].replace(',', '.')
+                    end_time = times[1].replace(',', '.')
+                    # 获取文本（可能有多行）
+                    text = ' '.join(lines[2:])
+                    subtitles.append({
+                        'start': start_time,
+                        'end': end_time,
+                        'text': text
                     })
-                except Exception as e:
-                    print(f"Error sending final progress: {e}")
+            
+            return subtitles
 
-            # 返回处理后的视频
-            return Response(
-                content=video_data,
-                media_type="video/mp4",
-                headers={
-                    "Content-Disposition": f"attachment; filename=output_{safe_video_name}"
-                }
+        # 在 merge_subtitle 函数中替换字幕处理部分
+        subtitles = parse_srt(srt_path)
+
+        # 构建复杂的drawtext滤镜
+        filter_complex = []
+        for i, sub in enumerate(subtitles):
+            # 转义文本中的特殊字符，使用双引号而不是单引号
+            escaped_text = sub['text'].replace('"', '\\"').replace('\n', ' ')
+            
+            # 转换时间戳为秒数
+            def timestamp_to_seconds(ts):
+                h, m, s = ts.split(':')
+                return float(h) * 3600 + float(m) * 60 + float(s)
+            
+            start_time = timestamp_to_seconds(sub['start'])
+            end_time = timestamp_to_seconds(sub['end'])
+            
+            # 计算位置
+            position = {
+                'top': f"y=h*0.1",
+                'bottom': f"y=h*0.9"
+            }[vertical_position]
+            
+            if horizontal_position == 'center':
+                position += ":x=(w-text_w)/2"
+            elif horizontal_position == 'left':
+                position += ":x=w*0.1"
+            else:  # right
+                position += ":x=w*0.9-text_w"
+            
+            # 构建单个drawtext滤镜
+            filter_complex.append(
+                f"drawtext=text=\"{escaped_text}\""
+                f":fontsize={font_size}"
+                f":fontcolor={font_color}"
+                f":fontfile=/Windows/Fonts/msyh.ttc"
+                f":{position}"
+                f":enable='between(t,{start_time},{end_time})'"
+                f":box=1:boxcolor=black@0.5:boxborderw=5"
             )
+
+        # 构建 ffmpeg 命令，使用引号包裹滤镜字符串
+        filter_string = ','.join(filter_complex)
+        cmd = [
+            "ffmpeg",
+            "-i", video_path_str,
+            "-vf", filter_string,
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-c:a', 'copy',
+            '-y',
+            output_path_str
+        ]
+
+        # 打印调试信息
+        print("\nDEBUG INFO:")
+        print(f"Filter string: {filter_string}")
+        print(f"Full Command: {' '.join(cmd)}")
+
+        # 修改这里：使用 subprocess.run 时指定编码
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',  # 明确指定编码为 utf-8
+            errors='replace',  # 处理无法解码的字符
+            check=False  # 不要自动抛出异常
+        )
+        
+        if result.returncode != 0:
+            print(f"\nFFmpeg 错误输出: {result.stderr}")
+            raise Exception(f"FFmpeg error: {result.stderr}")
             
-        finally:
-            # 清理临时文件
-            for file in [video_path, srt_path, output_path, final_output]:
-                try:
-                    if file.exists():
-                        file.unlink()
-                except Exception as e:
-                    print(f"Error deleting {file}: {e}")
+        # 确保输出文件存在且大小不为0
+        if not output_path.exists():
+            raise Exception("输出文件生成失败")
             
+        if output_path.stat().st_size == 0:
+            raise Exception("输出文件大小为0")
+        
+        print("\n处理完成，读取输出文件")
+        
+        # 读取输出文件
+        with open(output_path, 'rb') as f:
+            video_data = f.read()
+        
+        return Response(
+            content=video_data,
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f"attachment; filename=output_{video.filename}"
+            }
+        )
+        
     except Exception as e:
+        print(f"\n处理错误: {str(e)}")
+        traceback.print_exc()
         return JSONResponse(
             status_code=500,
             content={"error": str(e)}
         )
-
-def get_video_info(video_path: str) -> dict:
-    """获取视频信息"""
-    cmd = [
-        'ffprobe',
-        '-v', 'error',
-        '-select_streams', 'v:0',
-        '-show_entries', 'stream=width,height',
-        '-of', 'json',
-        video_path
-    ]
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise Exception(f"FFprobe error: {result.stderr}")
-    
-    info = json.loads(result.stdout)
-    return info.get('streams', [{}])[0]
+        
+    finally:
+        print("\n清理临时文件")
+        # 清理临时文件
+        for file in [video_path, srt_path, output_path]:
+            try:
+                if file.exists():
+                    file.unlink()
+                    print(f"- 已删除: {file}")
+            except Exception as e:
+                print(f"- 删除失败 {file}: {e}")
+        print("=== 处理结束 ===\n")
 
 def calculate_position(width, height, text_width, text_height, horizontal_position, vertical_position, x_offset, y_offset):
     # 水平位置计算
