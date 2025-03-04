@@ -177,37 +177,33 @@ def format_time(seconds):
     secs = int(secs)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millisecs:03d}"
 
-def adjust_timestamps(segments, total_time, smart_distribution=True):
+def adjust_timestamps(segments, total_time):
     """
-    调整所有段落的时间戳
-    - segments: 所有段落（包括已识别和未识别的）
-    - total_time: 总时间
-    - smart_distribution: 是否使用智能分配
+    重新调整所有段落的时间戳
+    - segments: 所有段落（包括识别文本和对齐文本）
+    - total_time: 音频总时长
     """
     if not segments:
         return []
     
+    # 计算所有文本的总字符数（优先使用对齐文本）
+    total_chars = sum(len(segment["alignedText"] or segment["recognizedText"]) for segment in segments)
+    
     results = []
     current_time = 0
     
-    if smart_distribution:
-        # 智能分配：根据文本长度
-        total_chars = sum(len(segment["alignedText"]) for segment in segments)
+    # 根据文本长度比例分配时间
+    for segment in segments:
+        # 优先使用对齐文本的长度
+        text_length = len(segment["alignedText"] or segment["recognizedText"])
         
-        for segment in segments:
-            duration = (len(segment["alignedText"]) / total_chars) * total_time if total_chars > 0 else 0.1
-            
-            segment["timestamps"] = [current_time, current_time + duration]
-            results.append(segment)
-            current_time += duration
-    else:
-        # 平均分配：每段时间相等
-        segment_duration = total_time / len(segments)
+        # 计算该段落应占用的时间长度
+        duration = (text_length / total_chars) * total_time if total_chars > 0 else 0.1
         
-        for segment in segments:
-            segment["timestamps"] = [current_time, current_time + segment_duration]
-            results.append(segment)
-            current_time += segment_duration
+        # 更新时间戳
+        segment["timestamps"] = [current_time, current_time + duration]
+        results.append(segment)
+        current_time += duration
     
     return results
 
@@ -803,41 +799,54 @@ async def vip_text_alignment_ws(websocket: WebSocket):
             print(f"\n识别文本段落: {[seg['text'] for seg in recognized_segments]}")
             print(f"识别文本段落数: {len(recognized_segments)}")
             
-            # 5. 创建对齐结果
-            max_segments = max(len(recognized_segments), len(align_segments))
+            # 准备对齐结果
             alignment_results = []
             
-            print("\n创建对齐结果...")
-            for i in range(max_segments):
-                # 获取识别文本和时间戳
-                if i < len(recognized_segments):
-                    rec_text = recognized_segments[i]["text"]
-                    timestamps = recognized_segments[i]["timestamps"]
-                else:
-                    # 如果识别文本段落不够，使用空字符串和最后一个时间戳
-                    last_time = recognized_segments[-1]["timestamps"][1] if recognized_segments else 0
+            # 获取音频总时长
+            total_time = recognized_segments[-1]["timestamps"][1] if recognized_segments else 0
+            
+            # 判断文本段落数量关系
+            if len(align_segments) > len(recognized_segments):
+                # 对齐文本更多，需要重新分配所有时间
+                for i in range(len(align_segments)):
                     rec_text = ""
-                    timestamps = [last_time, last_time + 1.0]
+                    if i < len(recognized_segments):
+                        rec_text = recognized_segments[i]["text"]
+                    
+                    alignment_results.append({
+                        "recognizedText": rec_text,
+                        "alignedText": align_segments[i],
+                        "timestamps": [0, 0]  # 临时时间戳
+                    })
                 
-                # 获取对齐文本
-                align_text = align_segments[i] if i < len(align_segments) else ""
+                # 重新调整所有段落的时间戳
+                alignment_results = adjust_timestamps(alignment_results, total_time)
                 
-                # 添加对齐结果
-                alignment_results.append({
-                    "recognizedText": rec_text,
-                    "alignedText": align_text,
-                    "timestamps": timestamps
-                })
+            else:
+                # 识别文本段落数量大于等于对齐文本，保持原有时间戳
+                max_segments = max(len(recognized_segments), len(align_segments))
+                
+                for i in range(max_segments):
+                    if i < len(recognized_segments):
+                        rec_text = recognized_segments[i]["text"]
+                        timestamps = recognized_segments[i]["timestamps"]
+                    else:
+                        rec_text = ""
+                        last_time = recognized_segments[-1]["timestamps"][1]
+                        timestamps = [last_time, last_time + 1.0]
+                    
+                    align_text = align_segments[i] if i < len(align_segments) else ""
+                    
+                    alignment_results.append({
+                        "recognizedText": rec_text,
+                        "alignedText": align_text,
+                        "timestamps": timestamps
+                    })
             
-            print(f"\n对齐结果数量: {len(alignment_results)}")
-
-            print(alignment_results)
-            
-            # 6. 返回结果
+            # 返回结果
             await websocket.send_json({
                 "type": "complete",
-                "results": alignment_results,
-                "recognized_text": result[0][0]["text"]
+                "results": alignment_results
             })
             
     except Exception as e:
