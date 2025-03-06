@@ -31,6 +31,7 @@ from funasr import AutoModel
 import ffmpeg
 import traceback
 import aiofiles
+import math
 
 class Language(str, Enum):
     auto = "auto"
@@ -492,6 +493,7 @@ def merge_results(results: List[dict]) -> dict:
 @app.websocket("/api/v1/vip/asr/ws")
 async def vip_speech_to_text_ws(websocket: WebSocket):
     await websocket.accept()
+    temp_files = []  # 用于跟踪所有临时文件
     
     try:
         print("开始处理新的 WebSocket 请求...")
@@ -500,93 +502,120 @@ async def vip_speech_to_text_ws(websocket: WebSocket):
         data = await websocket.receive_bytes()
         print(f"接收到音频数据，大小: {len(data)} bytes")
         
-        # 创建临时目录存储音频文件
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_input = Path(temp_dir) / f"original_{uuid.uuid4()}"
-            temp_wav = Path(temp_dir) / f"{uuid.uuid4()}.wav"
-            
-            # 写入接收到的数据
-            async with aiofiles.open(temp_input, "wb") as f:
-                await f.write(data)
-            
-            try:
-                # 修改 ffprobe 命令执行方式
-                probe_cmd = [
-                    'ffprobe', 
-                    '-v', 'quiet',
-                    '-print_format', 'json',
-                    '-show_format',
-                    '-show_streams',
-                    str(temp_input)
-                ]
-                probe_result = subprocess.run(
-                    probe_cmd, 
-                    capture_output=True, 
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace'
-                )
+        # 创建本地temp目录（如果不存在）
+        temp_dir = Path.cwd() / "temp"
+        temp_dir.mkdir(exist_ok=True)
+        
+        # 生成唯一标识符用于此次请求的所有文件
+        session_id = uuid.uuid4()
+        
+        # 生成唯一文件名（添加.mp4扩展名）
+        temp_input = temp_dir / f"original_{session_id}.mp4"  # 原始文件
+        temp_files.append(temp_input)
+        
+        # 写入接收到的数据
+        async with aiofiles.open(temp_input, "wb") as f:
+            await f.write(data)
+        
+        print(f"原始音频文件已保存至: {temp_input}")
+        
+        try:
+            # 获取音频总时长
+            probe_cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                str(temp_input)
+            ]
+            result = subprocess.run(probe_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise ValueError(f"获取音频时长失败: {result.stderr}")
                 
-                if not probe_result.stdout:
-                    raise ValueError("无法读取文件格式信息")
+            total_duration = float(result.stdout.strip())
+            print(f"音频总时长: {total_duration}秒")
+            
+            # 计算需要切割的片段数（改为10秒一段）
+            segment_duration = 10  # 每段10秒
+            num_segments = math.ceil(total_duration / segment_duration)
+            print(f"需要处理的片段数: {num_segments}")
+            
+            all_results = []
+            current_time_offset = 0  # 用于时间戳偏移
+            
+            # 处理每个片段
+            for i in range(num_segments):
+                print(f"\n处理第 {i+1}/{num_segments} 段:")
+                
+                # 为当前片段创建临时文件（使用session_id和段号）
+                temp_segment = temp_dir / f"segment_{session_id}_{i+1}.wav"
+                temp_files.append(temp_segment)
+                
+                # 计算当前片段的起始时间和持续时间
+                start_time = i * segment_duration
+                current_duration = min(segment_duration, total_duration - start_time)
+                
+                print(f"\n开始切割音频片段 {i+1}:")
+                print(f"起始时间: {start_time}秒")
+                print(f"持续时间: {current_duration}秒")
+                print(f"输出文件: {temp_segment}")
                 
                 try:
-                    format_info = json.loads(probe_result.stdout)
-                except json.JSONDecodeError:
-                    raise ValueError("文件格式信息解析失败")
+                    # 使用ffmpeg切割并转换音频片段
+                    segment_cmd = [
+                        'ffmpeg',
+                        '-i', str(temp_input),
+                        '-ss', str(start_time),
+                        '-t', str(current_duration),
+                        '-acodec', 'pcm_s16le',
+                        '-ac', '1',
+                        '-ar', '16000',
+                        '-y',
+                        str(temp_segment)
+                    ]
+                    
+                    print(f"执行FFmpeg命令: {' '.join(segment_cmd)}")
+                    
+                    # 使用subprocess.Popen获取实时输出
+                    process = subprocess.Popen(
+                        segment_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        universal_newlines=True
+                    )
+                    
+                    # 读取输出
+                    stdout, stderr = process.communicate()
+                    
+                    if process.returncode != 0:
+                        print(f"FFmpeg错误输出:")
+                        print(f"标准输出: {stdout}")
+                        print(f"错误输出: {stderr}")
+                        raise ValueError(f"音频片段切割失败: {stderr}")
+                    
+                    # 验证文件是否生成并且大小不为0
+                    if not temp_segment.exists():
+                        raise ValueError(f"切割后的文件未生成: {temp_segment}")
+                    
+                    file_size = temp_segment.stat().st_size
+                    if file_size == 0:
+                        raise ValueError(f"生成的文件大小为0: {temp_segment}")
+                    
+                    print(f"音频片段切割成功:")
+                    print(f"- 文件路径: {temp_segment}")
+                    print(f"- 文件大小: {file_size} bytes")
+                    
+                except Exception as e:
+                    print(f"切割音频片段时发生错误: {str(e)}")
+                    raise
                 
-                # 检查是否包含音频流
-                has_audio = any(stream['codec_type'] == 'audio' 
-                              for stream in format_info.get('streams', []))
-                
-                if not has_audio:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "文件中未检测到音频内容"
-                    })
-                    return
-                
-                # 提取/转换音频为 WAV 格式
-                cmd = [
-                    'ffmpeg', '-i', str(temp_input),
-                    '-vn',  # 去除视频流
-                    '-acodec', 'pcm_s16le',
-                    '-ac', '1',  # 转换为单声道
-                    '-ar', '16000',  # 采样率16kHz
-                    '-y',  # 覆盖已存在的文件
-                    str(temp_wav)
-                ]
-                
-                # 执行 ffmpeg 命令
-                process = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace'
-                )
-                
-                if process.returncode != 0:
-                    raise ValueError(f"音频转换失败: {process.stderr}")
-                
-                # 读取转换后的 WAV 文件
-                waveform, sample_rate = torchaudio.load(temp_wav)
-                waveform = waveform.mean(0)  # 转为单声道
-                
-                # 切割音频
-                segments = split_audio(waveform, sample_rate)
-                total_segments = len(segments)
-                
-                print(f"音频片段数量: {total_segments}")
-                
-                all_results = []
-                current_time_offset = 0  # 添加时间偏移量
-                
-                for i, segment in enumerate(segments, 1):
-                    print(f"\n处理第 {i}/{total_segments} 段:")
+                # 处理当前片段
+                try:
+                    waveform, sample_rate = torchaudio.load(temp_segment)
+                    waveform = waveform.mean(0)
                     
                     result = m.inference(
-                        data_in=segment,
+                        data_in=waveform,
                         language="auto",
                         use_itn=True,
                         output_timestamp=True,
@@ -595,6 +624,8 @@ async def vip_speech_to_text_ws(websocket: WebSocket):
                         **kwargs
                     )
 
+                    print(f"语音识别结果: {result}")
+                    
                     if result and len(result) > 0 and len(result[0]) > 0:
                         text = result[0][0]["text"]
                         
@@ -604,33 +635,43 @@ async def vip_speech_to_text_ws(websocket: WebSocket):
                             
                             current_text = []
                             current_timestamps = []
-                            last_end_time = 0
                             
-                            for j, ts in enumerate(timestamps):
+                            for ts in timestamps:
                                 if len(ts) >= 3:
                                     char, start_time, end_time = ts
-                                    # 添加时间偏移
-                                    start_time += current_time_offset
-                                    end_time += current_time_offset
+                                    # 添加片段的时间偏移
+                                    adjusted_start = start_time + (i * segment_duration)
+                                    adjusted_end = end_time + (i * segment_duration)
                                     
                                     if char not in ['。', '，', '、', '！', '？', '.', ',', '!', '?']:
                                         current_text.append(char)
-                                        current_timestamps.append([start_time, end_time])
-                                        last_end_time = end_time
+                                        current_timestamps.append([adjusted_start, adjusted_end])
                                     elif current_text:
-                                        sentence = ''.join(current_text).strip()
+                                        sentence = ''.join(current_text)
                                         if sentence and current_timestamps:
                                             subtitle = {
                                                 "text": sentence,
                                                 "timestamps": [
-                                                    current_timestamps[0][0],
-                                                    end_time
+                                                    current_timestamps[0][0],  # 使用第一个字的开始时间
+                                                    adjusted_end  # 使用标点符号的结束时间
                                                 ]
                                             }
                                             subtitles.append(subtitle)
                                             current_text = []
                                             current_timestamps = []
-                                            last_end_time = end_time
+                        
+                        # 处理最后一个句子（如果没有以标点符号结尾）
+                        if current_text:
+                            sentence = ''.join(current_text)
+                            if sentence and current_timestamps:
+                                subtitle = {
+                                    "text": sentence,
+                                    "timestamps": [
+                                        current_timestamps[0][0],
+                                        current_timestamps[-1][1]
+                                    ]
+                                }
+                                subtitles.append(subtitle)
                         
                         segment_result = {
                             "text": text,
@@ -638,31 +679,33 @@ async def vip_speech_to_text_ws(websocket: WebSocket):
                         }
                         all_results.append(segment_result)
                         
-                        # 更新时间偏移量
-                        current_time_offset = last_end_time
-                        
                         # 发送进度更新
                         await websocket.send_json({
                             "type": "segment_complete",
-                            "current_segment": i,
-                            "total_segments": total_segments,
+                            "current_segment": i + 1,
+                            "total_segments": num_segments,
                             "segment_result": segment_result
                         })
-                
-                # 发送最终结果
-                await websocket.send_json({
-                    "type": "complete",
-                    "results": all_results
-                })
-                
-            except Exception as e:
-                print(f"处理错误: {str(e)}")
-                traceback.print_exc()
-                await websocket.send_json({
-                    "type": "error",
-                    "message": str(e)
-                })
-                
+                    
+                except Exception as e:
+                    print(f"处理音频片段时发生错误: {str(e)}")
+                    raise
+
+            # 发送最终结果
+            await websocket.send_json({
+                "type": "complete",
+                "results": all_results,
+                "session_id": str(session_id)
+            })
+            
+        except Exception as e:
+            print(f"处理错误: {str(e)}")
+            traceback.print_exc()
+            await websocket.send_json({
+                "type": "error",
+                "message": str(e)
+            })
+            
     except Exception as e:
         print(f"发生错误: {str(e)}")
         traceback.print_exc()
@@ -671,7 +714,15 @@ async def vip_speech_to_text_ws(websocket: WebSocket):
             "message": str(e)
         })
     finally:
-        print("WebSocket 连接关闭")
+        print("\n=== 临时文件信息 ===")
+        print(f"Session ID: {session_id}")
+        print("所有临时文件:")
+        for file in temp_files:
+            if file.exists():
+                print(f"- {file} ({file.stat().st_size} bytes)")
+            else:
+                print(f"- {file} (文件不存在)")
+        print("=== 处理结束 ===\n")
         await websocket.close()
 
 @app.websocket("/api/v1/vip/align/ws")

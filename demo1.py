@@ -23,7 +23,7 @@ model = AutoModel(
 
 # en
 res = model.generate(
-    input=f"E:/M800002mRbOA2rFHEV.mp3",
+    input=f"./temp/a650c708-12b4-4a04-b1f3-79a3d3535896.wav",
     cache={},
     language="auto",  # "zh", "en", "yue", "ja", "ko", "nospeech"
     use_itn=True,
