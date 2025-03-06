@@ -759,119 +759,116 @@ async def vip_text_alignment_ws(websocket: WebSocket):
             with open(original_file, "wb") as f:
                 f.write(audio_data)
             
-            # 使用 ffprobe 检测文件格式
-            try:
-                probe_cmd = [
-                    'ffprobe', 
-                    '-v', 'quiet',
-                    '-print_format', 'json',
-                    '-show_format',
-                    '-show_streams',
-                    str(original_file)
-                ]
-                probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
-                format_info = json.loads(probe_result.stdout)
+            # 获取音频时长
+            probe_cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                str(original_file)
+            ]
+            result = subprocess.run(probe_cmd, capture_output=True, text=True)
+            total_duration = float(result.stdout.strip())
+            print(f"音频总时长: {total_duration}秒")
+            
+            # 计算需要切割的片段数（10秒一段）
+            segment_duration = 10
+            num_segments = math.ceil(total_duration / segment_duration)
+            print(f"需要处理的片段数: {num_segments}")
+            
+            all_timestamps = []
+            all_text = []
+            
+            # 处理每个片段
+            for i in range(num_segments):
+                print(f"\n处理第 {i+1}/{num_segments} 段:")
                 
-                # 检查是否包含音频流
-                has_audio = any(stream['codec_type'] == 'audio' 
-                              for stream in format_info.get('streams', []))
+                # 为当前片段创建临时文件
+                segment_file = Path(temp_dir) / f"segment_{i+1}.wav"
                 
-                if not has_audio:
-                    raise ValueError("文件中未检测到音频内容")
+                # 计算当前片段的起始时间和持续时间
+                start_time = i * segment_duration
+                current_duration = min(segment_duration, total_duration - start_time)
                 
-                # 转换为WAV格式
-                wav_file = Path(temp_dir) / f"{uuid.uuid4()}.wav"
-                cmd = [
+                # 使用ffmpeg切割并转换音频片段
+                segment_cmd = [
                     'ffmpeg', '-i', str(original_file),
-                    '-vn', '-acodec', 'pcm_s16le',
-                    '-ac', '1', '-ar', '16000', '-y',
-                    str(wav_file)
+                    '-ss', str(start_time),
+                    '-t', str(current_duration),
+                    '-acodec', 'pcm_s16le',
+                    '-ac', '1', '-ar', '16000',
+                    '-y', str(segment_file)
                 ]
-                print(f"\n执行音频转换...")
-                subprocess.run(cmd, check=True, capture_output=True)
                 
-            except subprocess.CalledProcessError as e:
+                subprocess.run(segment_cmd, check=True, capture_output=True)
+                
+                # 处理当前片段
+                waveform, sample_rate = torchaudio.load(segment_file)
+                waveform = waveform.mean(0)
+                
+                result = m.inference(
+                    data_in=waveform,
+                    language="auto",
+                    use_itn=True,
+                    output_timestamp=True,
+                    ban_emo_unk=True,
+                    fs=sample_rate,
+                    **kwargs
+                )
+                
+                if result and len(result) > 0 and len(result[0]) > 0:
+                    # 调整时间戳以反映在整个音频中的实际位置
+                    for ts in result[0][0]["timestamp"]:
+                        if len(ts) >= 3:
+                            char, ts_start, ts_end = ts
+                            all_timestamps.append([char, ts_start + start_time, ts_end + start_time])
+                            all_text.append(char)
+                
+                # 发送进度更新
                 await websocket.send_json({
-                    "type": "error",
-                    "message": f"音频处理失败: {e.stderr.decode()}"
+                    "type": "progress",
+                    "current": i + 1,
+                    "total": num_segments
                 })
-                return
-            except json.JSONDecodeError:
-                await websocket.send_json({
-                    "type": "error",
-                    "message": "无法识别的文件格式"
-                })
-                return
             
-            # 读取转换后的 WAV 文件
-            waveform, sample_rate = torchaudio.load(wav_file)
-            waveform = waveform.mean(0)
-            
-            # 语音识别
-            print("\n开始语音识别...")
-            result = m.inference(
-                data_in=waveform,
-                language="auto",
-                use_itn=True,
-                output_timestamp=True,
-                ban_emo_unk=True,
-                fs=sample_rate,
-                **kwargs
-            )
-
-            print(f"语音识别结果: {result}")
-            
-            if not result or not result[0]:
-                raise ValueError("语音识别失败")
-            
-            # 4. 处理识别结果，按标点符号分段
-            timestamps = result[0][0]["timestamp"]
+            # 处理合并后的识别结果
             recognized_segments = []
             current_segment = []
             current_start = None
             
-            print("\n处理识别结果...")
-            for ts in timestamps:
-                if len(ts) >= 3:
-                    char, start_time, end_time = ts
-                    
-                    # 记录段落起始时间
-                    if not current_start:
-                        current_start = start_time
-                    
-                    # 遇到标点符号或最后一个字符时保存当前段落
-                    if char in ['。', '，', '、', '！', '？', '.', ',', '!', '?']:
-                        if current_segment:
-                            segment_text = ''.join(current_segment)
-                            recognized_segments.append({
-                                "text": segment_text,
-                                "timestamps": [current_start, end_time]
-                            })
-                            current_segment = []
-                            current_start = None
-                    else:
-                        current_segment.append(char)
+            # 使用合并后的时间戳处理分段
+            for ts in all_timestamps:
+                char, start_time, end_time = ts
+                
+                if not current_start:
+                    current_start = start_time
+                
+                if char in ['。', '，', '、', '！', '？', '.', ',', '!', '?']:
+                    if current_segment:
+                        segment_text = ''.join(current_segment)
+                        recognized_segments.append({
+                            "text": segment_text,
+                            "timestamps": [current_start, end_time]
+                        })
+                        current_segment = []
+                        current_start = None
+                else:
+                    current_segment.append(char)
             
             # 处理最后一个段落
             if current_segment:
                 segment_text = ''.join(current_segment)
                 recognized_segments.append({
                     "text": segment_text,
-                    "timestamps": [current_start, timestamps[-1][2]]
+                    "timestamps": [current_start, all_timestamps[-1][2]]
                 })
-            
-            print(f"\n识别文本段落: {[seg['text'] for seg in recognized_segments]}")
-            print(f"识别文本段落数: {len(recognized_segments)}")
             
             # 准备对齐结果
             alignment_results = []
+            total_time = all_timestamps[-1][2] if all_timestamps else 0
             
-            # 获取音频总时长
-            total_time = recognized_segments[-1]["timestamps"][1] if recognized_segments else 0
-            
-            # 判断文本段落数量关系
+            # 使用原有的对齐逻辑
             if len(align_segments) > len(recognized_segments):
-                # 对齐文本更多，需要重新分配所有时间
                 for i in range(len(align_segments)):
                     rec_text = ""
                     if i < len(recognized_segments):
@@ -880,16 +877,12 @@ async def vip_text_alignment_ws(websocket: WebSocket):
                     alignment_results.append({
                         "recognizedText": rec_text,
                         "alignedText": align_segments[i],
-                        "timestamps": [0, 0]  # 临时时间戳
+                        "timestamps": [0, 0]
                     })
                 
-                # 重新调整所有段落的时间戳
                 alignment_results = adjust_timestamps(alignment_results, total_time)
-                
             else:
-                # 识别文本段落数量大于等于对齐文本，保持原有时间戳
                 max_segments = max(len(recognized_segments), len(align_segments))
-                
                 for i in range(max_segments):
                     if i < len(recognized_segments):
                         rec_text = recognized_segments[i]["text"]
@@ -907,7 +900,7 @@ async def vip_text_alignment_ws(websocket: WebSocket):
                         "timestamps": timestamps
                     })
             
-            # 返回结果
+            # 返回结果，保持原有结构
             await websocket.send_json({
                 "type": "complete",
                 "results": alignment_results
