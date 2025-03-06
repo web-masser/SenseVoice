@@ -1062,14 +1062,14 @@ async def merge_subtitle(
             
             return subtitles
 
-        # 在 merge_subtitle 函数中替换字幕处理部分
+        # 在 merge_subtitle 函数中修改 filter_complex 部分
         subtitles = parse_srt(srt_path)
 
         # 构建复杂的drawtext滤镜
         filter_complex = []
         for i, sub in enumerate(subtitles):
-            # 转义文本中的特殊字符，使用双引号而不是单引号
-            escaped_text = sub['text'].replace('"', '\\"').replace('\n', ' ')
+            # 转义文本中的特殊字符，确保正确处理中文
+            escaped_text = sub['text'].replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'").replace('\n', ' ')
             
             # 转换时间戳为秒数
             def timestamp_to_seconds(ts):
@@ -1092,15 +1092,16 @@ async def merge_subtitle(
             else:  # right
                 position += ":x=w*0.9-text_w"
             
-            # 构建单个drawtext滤镜
+            # 修改这里: 使用系统字体并添加字体回退选项
             filter_complex.append(
-                f"drawtext=text=\"{escaped_text}\""
+                f"drawtext=text='{escaped_text}'"
+                f":fontfile='/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'"  # Linux 系统字体
+                f",drawtext=text='{escaped_text}'"
+                f":fontfile='C\\:/Windows/Fonts/msyh.ttc'"  # Windows 系统字体
                 f":fontsize={font_size}"
                 f":fontcolor={font_color}"
-                f":fontfile=/Windows/Fonts/msyh.ttc"
                 f":{position}"
                 f":enable='between(t,{start_time},{end_time})'"
-                f":box=1:boxcolor=black@0.5:boxborderw=5"
             )
 
         # 构建 ffmpeg 命令，使用引号包裹滤镜字符串
@@ -1117,19 +1118,18 @@ async def merge_subtitle(
             output_path_str
         ]
 
-        # 打印调试信息
+        # 添加调试信息
         print("\nDEBUG INFO:")
         print(f"Filter string: {filter_string}")
         print(f"Full Command: {' '.join(cmd)}")
 
-        # 修改这里：使用 subprocess.run 时指定编码
+        # 修改执行命令部分，添加更详细的错误输出
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            encoding='utf-8',  # 明确指定编码为 utf-8
-            errors='replace',  # 处理无法解码的字符
-            check=False  # 不要自动抛出异常
+            encoding='utf-8',
+            errors='replace'
         )
         
         if result.returncode != 0:
